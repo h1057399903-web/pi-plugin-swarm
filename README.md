@@ -54,7 +54,7 @@ These are optional networked acceptance tests rather than part of the offline un
 
 ## Workbench integration
 
-The package exports `pi-plugin-swarm/core`, a process-level singleton event/control API. Other Pi packages can subscribe to safe run/worker snapshots, cancel an active run, and render progress without reading worker transcripts, credentials, errors, absolute working directories, or session file paths. Registration is idempotent through `Symbol.for(...)`, so a host and the standalone extension do not register duplicate `/swarm` commands.
+The package exports `pi-plugin-swarm/core`, a process-level singleton event/control API. Other Pi packages can subscribe to safe run/worker snapshots, cancel an active run, and render progress without reading worker transcripts, credentials, errors, absolute working directories, or session file paths. The standalone package is the sole owner of `/swarm` and the `swarm` tool. Hosts such as Workbench consume only the public event/control API and never register Swarm commands themselves.
 
 ## Safety
 

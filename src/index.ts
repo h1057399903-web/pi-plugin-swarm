@@ -12,7 +12,6 @@ const INITIAL_LAUNCH_LIMIT = 5;
 const LAUNCH_STAGGER_MS = 700;
 const STATE_TYPE = "pi-swarm-state";
 const RUN_STATE_TYPE = "pi-swarm-run-v1";
-const REGISTER_KEY = Symbol.for("pi-plugin-swarm.extension.registered.v2");
 
 interface SwarmTask { item: string; prompt?: string; cwd?: string; timeoutMs?: number; agentId?: string; resume?: boolean; }
 
@@ -71,16 +70,6 @@ function makeWorker(runId: string, task: SwarmTask, index: number, resumable: bo
 }
 
 export function registerSwarmExtension(pi: ExtensionAPI): void {
-  type RegistrationToken = { version: 3 };
-  const root = globalThis as typeof globalThis & { [REGISTER_KEY]?: object | boolean };
-  const existing = root[REGISTER_KEY] as Partial<RegistrationToken> | boolean | undefined;
-  if (typeof existing === "object" && existing?.version === 3) return;
-  const registrationToken: RegistrationToken = { version: 3 };
-  root[REGISTER_KEY] = registrationToken;
-  pi.on("session_shutdown", (event) => {
-    if ((event.reason === "quit" || event.reason === "reload") && root[REGISTER_KEY] === registrationToken) delete root[REGISTER_KEY];
-  });
-
   const runtime = new SwarmAgentRuntime();
   const integration = getSwarmIntegration();
   let enabled = false;

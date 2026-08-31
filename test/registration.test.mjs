@@ -17,18 +17,14 @@ function fakePi() {
   };
 }
 
-// A long-running Pi may retain the legacy boolean marker from v0.3.0.
-globalThis[Symbol.for("pi-plugin-swarm.extension.registered.v2")] = true;
 const first = fakePi();
-registerSwarmExtension(first);
 registerSwarmExtension(first);
 assert.deepEqual(first.commands, ["swarm"]);
 assert.deepEqual(first.tools, ["swarm"]);
-for (const handler of first.handlers.get("session_shutdown") || []) handler({ reason: "reload" });
 
+// Pi owns extension lifecycle and invokes the standalone package once per load.
 const reloaded = fakePi();
 registerSwarmExtension(reloaded);
 assert.deepEqual(reloaded.commands, ["swarm"]);
 assert.deepEqual(reloaded.tools, ["swarm"]);
-for (const handler of reloaded.handlers.get("session_shutdown") || []) handler({ reason: "quit" });
 console.log("SWARM_RELOAD_REGISTRATION_OK");
