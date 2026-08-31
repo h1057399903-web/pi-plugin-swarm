@@ -103,6 +103,7 @@ export class SwarmBatch<T, R> {
   private lastRateLimitAt = -Infinity;
   private lastRecoveryAt = -Infinity;
   private started = false;
+  private aborting = false;
   private finished = false;
   private resolve!: (results: SwarmBatchResult<T, R>[]) => void;
   private abortListener?: () => void;
@@ -141,8 +142,9 @@ export class SwarmBatch<T, R> {
 
   private schedule(): void {
     if (this.finished) return;
-    this.recover();
     if (this.states.every((state) => state.result)) return this.finish();
+    if (this.aborting) { this.emit(); return; }
+    this.recover();
     const now = this.clock.now();
     // scheduler state is intentionally synchronous up to launcher invocation
     while (this.active.size < this.capacity) {
@@ -205,6 +207,11 @@ export class SwarmBatch<T, R> {
 
   private outcome(state: State<T, R>, context: SwarmLaunchContext, value: R): void {
     if (!this.active.delete(state.index) || this.finished) return;
+    if (this.aborting) {
+      state.status = "aborted";
+      state.result = { index: state.index, task: state.task, status: "aborted", attempts: state.attempts, error: "Batch aborted." };
+      return this.schedule();
+    }
     if (this.options.isRateLimitedResult?.(value, context)) return this.rateLimit(state);
     state.status = "completed";
     state.result = { index: state.index, task: state.task, status: "completed", attempts: state.attempts, value };
@@ -213,6 +220,11 @@ export class SwarmBatch<T, R> {
 
   private failure(state: State<T, R>, context: SwarmLaunchContext, error: unknown): void {
     if (!this.active.delete(state.index) || this.finished) return;
+    if (this.aborting) {
+      state.status = "aborted";
+      state.result = { index: state.index, task: state.task, status: "aborted", attempts: state.attempts, error: "Batch aborted." };
+      return this.schedule();
+    }
     if (this.options.isRateLimitedError?.(error, context)) return this.rateLimit(state);
     state.status = "failed";
     state.result = { index: state.index, task: state.task, status: "failed", attempts: state.attempts, error };
@@ -267,13 +279,20 @@ export class SwarmBatch<T, R> {
   }
 
   private abort(): void {
-    if (this.finished) return;
-    for (const controller of this.active.values()) controller.abort(this.options.signal?.reason ?? new Error("Aborted"));
-    for (const state of this.states) if (!state.result) {
+    if (this.finished || this.aborting) return;
+    this.aborting = true;
+    for (const [index, controller] of this.active) {
+      this.states[index].status = "aborted";
+      controller.abort(this.options.signal?.reason ?? new Error("Aborted"));
+    }
+    for (const state of this.states) if (!state.result && !this.active.has(state.index)) {
       state.result = { index: state.index, task: state.task, status: "aborted", attempts: state.attempts, error: "Batch aborted." };
       state.status = "aborted";
     }
-    this.finish();
+    for (const timer of this.timers) this.clock.clearTimeout(timer);
+    this.timers.clear();
+    this.wakeTimer = undefined;
+    if (this.active.size === 0) this.finish(); else this.emit();
   }
 
   private finish(): void {

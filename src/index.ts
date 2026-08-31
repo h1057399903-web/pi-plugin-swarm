@@ -12,9 +12,10 @@ const MAX_CONCURRENCY = 16;
 const INITIAL_LAUNCH_LIMIT = 5;
 const LAUNCH_STAGGER_MS = 700;
 const STATE_TYPE = "pi-swarm-state";
+const RUN_STATE_TYPE = "pi-swarm-run-v1";
 const REGISTER_KEY = Symbol.for("pi-plugin-swarm.extension.registered.v2");
 
-interface SwarmTask { item: string; prompt?: string; cwd?: string; timeoutMs?: number; }
+interface SwarmTask { item: string; prompt?: string; cwd?: string; timeoutMs?: number; agentId?: string; resume?: boolean; }
 
 const WorkerTask = Type.Object({
   item: Type.String({ description: "Short item name or bounded work package" }),
@@ -23,15 +24,22 @@ const WorkerTask = Type.Object({
   timeoutMs: Type.Optional(Type.Integer({ minimum: 1_000, maximum: 3_600_000, description: "Optional worker timeout" })),
 });
 
+const ResumeAgentMap = Type.Record(Type.String({ minLength: 1 }), Type.String({ minLength: 1 }), { maxProperties: MAX_TASKS, description: "Map of prior agent ID to its follow-up prompt; resumed workers launch first" });
+
 const SwarmParameters = Type.Object({
   description: Type.String({ description: "Short description of the whole swarm" }),
-  tasks: Type.Array(WorkerTask, { minItems: 1, maxItems: MAX_TASKS, description: "Bounded independent work packages" }),
+  tasks: Type.Optional(Type.Array(WorkerTask, { minItems: 1, maxItems: MAX_TASKS, description: "Bounded independent work packages" })),
+  items: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: MAX_TASKS, description: "Kimi-compatible shorthand: each item launches one new worker" })),
+  resumeAgentIds: Type.Optional(ResumeAgentMap),
+  resume_agent_ids: Type.Optional(ResumeAgentMap),
+  fork: Type.Optional(Type.Boolean({ description: "Fork the current parent conversation into every new worker; incompatible with resume agent IDs" })),
   promptTemplate: Type.Optional(Type.String({ description: "Template for tasks without prompt; replace {{item}}" })),
+  prompt_template: Type.Optional(Type.String({ description: "Kimi-compatible alias for promptTemplate" })),
   concurrency: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_CONCURRENCY, description: "Maximum active workers; defaults to 2" })),
 });
 
 function safeError(value: unknown): string {
-  if (value instanceof Error && value.message) return value.message.slice(0, 500);
+  if (value instanceof Error && ["Worker failed.", "Worker timed out.", "Worker session is unavailable.", "Worker session is busy.", "Provider rate limit."].includes(value.message)) return value.message;
   return "Worker failed.";
 }
 
@@ -39,9 +47,12 @@ function publicStatus(status: SwarmTaskStatus): PublicSwarmWorker["status"] {
   return status;
 }
 
-function makeWorker(runId: string, task: SwarmTask, index: number): PublicSwarmWorker {
+function makeWorker(runId: string, task: SwarmTask, index: number, resumable: boolean): PublicSwarmWorker {
   return {
     workerId: `${runId}:${index + 1}`,
+    agentId: task.agentId ?? randomUUID(),
+    resumed: task.resume === true,
+    resumable,
     index,
     item: task.item.slice(0, 200),
     status: "queued",
@@ -72,6 +83,7 @@ export function registerSwarmExtension(pi: ExtensionAPI): void {
     for (const entry of ctx.sessionManager.getBranch()) {
       if (entry.type === "custom" && entry.customType === STATE_TYPE) enabled = Boolean((entry.data as { enabled?: unknown })?.enabled);
     }
+    integration.clearRuns();
     integration.setEnabled(enabled);
     ctx.ui.setStatus("swarm", enabled ? "🐝 swarm" : undefined);
   });
@@ -82,7 +94,7 @@ export function registerSwarmExtension(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("swarm", {
-    description: "Toggle Pi Swarm or start a task: /swarm on|off|status|<task>",
+    description: "Toggle/start/cancel Pi Swarm: /swarm on|off|status|cancel <run-id>|<task>",
     handler: async (raw, ctx) => {
       const args = raw.trim(); const lower = args.toLowerCase();
       if (!args || lower === "on" || lower === "off") {
@@ -94,6 +106,11 @@ export function registerSwarmExtension(pi: ExtensionAPI): void {
         const active = integration.snapshot().runs.filter((run) => run.status === "running").length;
         ctx.ui.notify(`Swarm ${enabled ? "ON" : "OFF"} · ${WORKER_MODEL} · ${WORKER_THINKING_LEVEL} · default ${DEFAULT_CONCURRENCY} · max tasks ${MAX_TASKS} · active runs ${active}`, "info"); return;
       }
+      if (lower.startsWith("cancel ")) {
+        const runId = args.slice(7).trim();
+        ctx.ui.notify(integration.cancelRun(runId) ? `Cancelling swarm ${runId}.` : `No active swarm ${runId}.`, integration.snapshot().runs.some((run) => run.runId === runId) ? "info" : "warning");
+        return;
+      }
       applyEnabled(true); persist(); ctx.ui.setStatus("swarm", "🐝 swarm");
       pi.sendUserMessage(`SWARM TASK: ${args}\nAct as coordinator. Delegate only necessary bounded work through the swarm tool, then inspect and integrate the result.`);
     },
@@ -102,37 +119,74 @@ export function registerSwarmExtension(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "swarm",
     label: "Swarm",
-    description: `Launch a Kimi-style bounded task swarm using in-process Pi AgentSessions. Supports 1-${MAX_TASKS} tasks, up to ${MAX_CONCURRENCY} active workers, initial burst ${INITIAL_LAUNCH_LIMIT}, then staggered launches. Workers always use ${WORKER_MODEL} at ${WORKER_THINKING_LEVEL}.`,
+    description: `Launch or resume a Kimi-style bounded task swarm using in-process Pi AgentSessions. Supports 1-${MAX_TASKS} tasks, up to ${MAX_CONCURRENCY} active workers, stable resumable agent IDs, optional parent-context fork, initial burst ${INITIAL_LAUNCH_LIMIT}, then staggered launches. Workers always use ${WORKER_MODEL} at ${WORKER_THINKING_LEVEL}.`,
     promptSnippet: "Delegate bounded independent packages to in-process Luna workers",
     promptGuidelines: [
       "Prefer one worker; parallelize only independent packages with non-overlapping file ownership.",
       "Never delegate credentials, production mutations, deployments, service restarts, device installation, or merges.",
       "Inspect worker changes and verification evidence before accepting them.",
+      "Use resume_agent_ids for follow-up work by a prior worker; use fork only when every new worker requires the parent conversation context.",
     ],
     parameters: SwarmParameters,
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
-      const tasks = params.tasks as SwarmTask[];
+      const shorthandTasks: SwarmTask[] = (params.items ?? []).map((item) => ({ item }));
+      const newTasks = [...((params.tasks ?? []) as SwarmTask[]), ...shorthandTasks];
+      const resumeMap = { ...(params.resume_agent_ids ?? {}), ...(params.resumeAgentIds ?? {}) };
+      const resumedTasks: SwarmTask[] = Object.entries(resumeMap).map(([agentId, prompt]) => ({ item: `Resume ${agentId}`, prompt, agentId, resume: true }));
+      if (params.fork && resumedTasks.length) throw new Error("fork cannot be combined with resumeAgentIds");
+      const tasks = [...resumedTasks, ...newTasks];
+      if (!tasks.length) throw new Error("Provide at least one task or resumeAgentIds entry");
+      if (tasks.length > MAX_TASKS) throw new Error(`A swarm may contain at most ${MAX_TASKS} workers`);
+      const ownerSessionId = ctx.sessionManager.getSessionId();
+      const parentSessionFile = ctx.sessionManager.getSessionFile();
+      const resumable = Boolean(parentSessionFile);
+      const forkSessionFile = params.fork ? parentSessionFile : undefined;
+      if (params.fork && !forkSessionFile) throw new Error("Fork requires a persisted parent session");
+      if (resumedTasks.length && !resumable) throw new Error("Resume requires a persisted parent session");
       const requestedConcurrency = Math.min(params.concurrency ?? DEFAULT_CONCURRENCY, MAX_CONCURRENCY);
       const runId = randomUUID();
-      const workers = tasks.map((task, index) => makeWorker(runId, task, index));
+      const workers = tasks.map((task, index) => makeWorker(runId, task, index, resumable));
       const run: PublicSwarmRun = { runId, description: params.description.slice(0, 500), status: "running", createdAt: Date.now(), requestedConcurrency, activeCapacity: requestedConcurrency, workers };
 
-      const publish = () => {
+      let publishTimer: ReturnType<typeof setTimeout> | undefined;
+      let lastPublishedAt = -Infinity;
+      const publishNow = () => {
+        if (publishTimer) { clearTimeout(publishTimer); publishTimer = undefined; }
+        lastPublishedAt = Date.now();
         integration.updateRun(run);
         const done = workers.filter((worker) => ["completed", "failed", "aborted", "rate_limited"].includes(worker.status)).length;
         onUpdate?.({ content: [{ type: "text", text: `Swarm: ${done}/${workers.length} finished` }], details: structuredClone(run) });
       };
-      publish();
+      const publish = (immediate = false) => {
+        const delay = 250 - (Date.now() - lastPublishedAt);
+        if (immediate || delay <= 0) publishNow();
+        else if (!publishTimer) publishTimer = setTimeout(publishNow, delay);
+      };
+      publish(true);
+      const runController = new AbortController();
+      integration.setRunController(runId, () => runController.abort(new Error("Swarm run cancelled.")));
+      const runSignal = signal ? AbortSignal.any([signal, runController.signal]) : runController.signal;
 
       const batch = new SwarmBatch(tasks, async (task, context) => {
         const worker = workers[context.index];
         worker.attempt = context.attempt;
-        const template = task.prompt ?? params.promptTemplate ?? "Complete this bounded work package: {{item}}";
+        const template = task.prompt ?? params.promptTemplate ?? params.prompt_template ?? "Complete this bounded work package: {{item}}";
         const prompt = template.replaceAll("{{item}}", task.item);
         const stop = () => runtime.abort(worker.workerId);
         context.signal.addEventListener("abort", stop, { once: true });
         try {
-          const result = await runtime.run({ workerId: worker.workerId, prompt, cwd: task.cwd ?? ctx.cwd, item: task.item, timeoutMs: task.timeoutMs }, (progress) => {
+          const result = await runtime.run({
+            workerId: worker.workerId,
+            agentId: worker.agentId,
+            ownerSessionId,
+            persist: resumable,
+            resume: task.resume === true || context.attempt > 1,
+            forkSessionFile: task.resume ? undefined : forkSessionFile,
+            prompt,
+            cwd: task.cwd ?? ctx.cwd,
+            item: task.item,
+            timeoutMs: task.timeoutMs,
+          }, (progress) => {
             worker.status = progress.status;
             worker.turns = progress.turns;
             if (progress.output) worker.output = progress.output;
@@ -154,7 +208,7 @@ export function registerSwarmExtension(pi: ExtensionAPI): void {
         maxRetries: 3,
         retryBaseMs: 3_000,
         capacityRecoveryMs: 180_000,
-        signal,
+        signal: runSignal,
         isRateLimitedResult: (result) => result.status === "rate_limited",
         onProgress: (progress) => {
           run.activeCapacity = progress.capacity;
@@ -168,13 +222,25 @@ export function registerSwarmExtension(pi: ExtensionAPI): void {
         },
       });
 
-      const results = await batch.run();
+      let results;
+      try { results = await batch.run(); }
+      finally { integration.setRunController(runId, undefined); }
       run.finishedAt = Date.now();
-      run.status = signal?.aborted || results.every((result) => result.status === "aborted") ? "aborted"
+      run.status = runSignal.aborted || results.every((result) => result.status === "aborted") ? "aborted"
         : results.some((result) => result.status === "failed" || result.status === "rate_limited") ? "failed" : "completed";
-      publish();
+      publish(true);
+      pi.appendEntry(RUN_STATE_TYPE, {
+        runId: run.runId,
+        description: run.description,
+        status: run.status,
+        createdAt: run.createdAt,
+        finishedAt: run.finishedAt,
+        requestedConcurrency: run.requestedConcurrency,
+        activeCapacity: run.activeCapacity,
+        workers: run.workers.map(({ output: _output, error: _error, ...worker }) => worker),
+      });
       const completed = workers.filter((worker) => worker.status === "completed").length;
-      const summaries = workers.map((worker) => `### Worker ${worker.index + 1}: ${worker.item} — ${worker.status}\n${worker.output || worker.error || "(no output)"}`);
+      const summaries = workers.map((worker) => `### Worker ${worker.index + 1}: ${worker.item} — ${worker.status}\nAgent ID: ${worker.agentId}${worker.resumable ? " (resumable)" : ""}\n${worker.output || worker.error || "(no output)"}`);
       return { content: [{ type: "text", text: `Swarm completed: ${completed}/${workers.length} succeeded\n\n${summaries.join("\n\n---\n\n")}` }], details: structuredClone(run) };
     },
     renderCall(args, theme) {
@@ -199,6 +265,8 @@ export function registerSwarmExtension(pi: ExtensionAPI): void {
 }
 
 function applyWorkerResult(worker: PublicSwarmWorker, result: WorkerResult): void {
+  worker.agentId = result.agentId;
+  worker.resumable = result.resumable;
   worker.status = result.status;
   worker.startedAt = result.startedAt;
   worker.finishedAt = result.finishedAt;

@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { SwarmAgentRuntime, MAX_OUTPUT_BYTES } from "../src/swarm-agent-runtime.ts";
 
 const model = {};
+const ownerDirectory = (owner) => `/test-agent/swarm/sessions/${createHash("sha256").update(owner).digest("hex").slice(0, 32)}`;
 function seams(makeSession, extra = {}) {
   let runtimes = 0;
   return {
@@ -83,7 +85,7 @@ function sessionFor(text, delay = 0) {
   });
   const result = await new SwarmAgentRuntime(seam).run({ workerId: "worker", prompt: "x", cwd: "/work", ownerSessionId: "owner/one", persist: true });
   assert.equal(result.agentId, "agent-1"); assert.equal(result.resumable, true); assert.equal(sessions[0].disposed, true);
-  assert.deepEqual(calls[0], ["create", "/work", "/test-agent/swarm/sessions/owner_one"]);
+  assert.deepEqual(calls[0], ["create", "/work", ownerDirectory("owner/one")]);
 }
 
 // resume only opens a matching session from the requested owner directory
@@ -91,28 +93,42 @@ function sessionFor(text, delay = 0) {
   const calls = []; let resumed;
   const seam = seams(() => (resumed = sessionFor("resumed")), {
     agentDirFactory: () => "/test-agent",
-    sessionListFactory: async (cwd, dir) => { calls.push(["list", cwd, dir]); return [{ id: "agent-2", path: `${dir}/agent-2.jsonl` }]; },
+    sessionListFactory: async (dir) => { calls.push(["list", dir]); return [{ id: "agent-2", path: `${dir}/agent-2.jsonl` }]; },
     sessionOpenFactory: (path, dir, cwd) => { calls.push(["open", path, dir, cwd]); return { getSessionId: () => "agent-2" }; },
   });
   const result = await new SwarmAgentRuntime(seam).run({ workerId: "resume", agentId: "agent-2", ownerSessionId: "owner", persist: true, resume: true, prompt: "x", cwd: "/work" });
-  assert.equal(result.output, "resumed"); assert.deepEqual(calls[1], ["open", "/test-agent/swarm/sessions/owner/agent-2.jsonl", "/test-agent/swarm/sessions/owner", "/work"]); assert.equal(resumed.disposed, true);
+  assert.equal(result.output, "resumed"); assert.deepEqual(calls[1], ["open", `${ownerDirectory("owner")}/agent-2.jsonl`, ownerDirectory("owner"), "/work"]); assert.equal(resumed.disposed, true);
+}
+
+// the same persisted agent cannot be opened concurrently
+{
+  const seam = seams(() => sessionFor("ok", 20), {
+    agentDirFactory: () => "/test-agent",
+    sessionCreateFactory: () => ({ getSessionId: () => "agent-busy" }),
+  });
+  const runtime = new SwarmAgentRuntime(seam);
+  const first = runtime.run({ workerId: "busy-1", agentId: "agent-busy", ownerSessionId: "owner", persist: true, prompt: "x", cwd: "/work" });
+  await Promise.resolve();
+  const second = await runtime.run({ workerId: "busy-2", agentId: "agent-busy", ownerSessionId: "owner", persist: true, prompt: "x", cwd: "/work" });
+  assert.equal(second.status, "failed"); assert.equal(second.error, "Worker session is busy.");
+  assert.equal((await first).status, "completed");
 }
 
 // wrong-owner and unavailable resume are rejected without exposing paths
 {
-  for (const list of [async () => [], async (_cwd, dir) => [{ id: "agent", path: "/other/agent.jsonl" }]]) {
+  for (const list of [async () => [], async () => [{ id: "agent", path: "/other/agent.jsonl" }]]) {
     let created = false;
     const result = await new SwarmAgentRuntime(seams(() => { created = true; return sessionFor("no"); }, { agentDirFactory: () => "/test-agent", sessionListFactory: list })).run({ workerId: "bad", agentId: "agent", ownerSessionId: "owner", persist: true, resume: true, prompt: "x", cwd: "/work" });
     assert.equal(result.status, "failed"); assert.equal(result.error, "Worker session is unavailable."); assert.equal(created, false);
   }
 }
 
-// fork uses the selected source file in the owner directory
+// fork accepts the trusted parent session as source but writes only inside the owner directory
 {
-  const calls = []; const source = "/test-agent/swarm/sessions/owner/source.jsonl";
-  const seam = seams(() => sessionFor("forked"), { agentDirFactory: () => "/test-agent", sessionForkFactory: (path, cwd, dir) => { calls.push([path, cwd, dir]); return { getSessionId: () => "forked-id" }; } });
-  const result = await new SwarmAgentRuntime(seam).run({ workerId: "fork", ownerSessionId: "owner", persist: true, forkSessionFile: source, prompt: "x", cwd: "/work" });
-  assert.equal(result.agentId, "forked-id"); assert.deepEqual(calls, [[source, "/work", "/test-agent/swarm/sessions/owner"]]);
+  const calls = []; const source = "/parent-sessions/source.jsonl";
+  const seam = seams(() => sessionFor("forked"), { agentDirFactory: () => "/test-agent", sessionForkFactory: (path, cwd, dir, agentId) => { calls.push([path, cwd, dir, agentId]); return { getSessionId: () => "forked-id" }; } });
+  const result = await new SwarmAgentRuntime(seam).run({ workerId: "fork", agentId: "requested-id", ownerSessionId: "owner", persist: true, forkSessionFile: source, prompt: "x", cwd: "/work" });
+  assert.equal(result.agentId, "requested-id"); assert.deepEqual(calls, [[source, "/work", ownerDirectory("owner"), "requested-id"]]);
 }
 
 // default remains in-memory even when an owner is supplied

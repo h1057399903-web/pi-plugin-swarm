@@ -88,14 +88,20 @@ const flush = () => new Promise((resolve) => queueMicrotask(resolve));
   assert.equal(attempts.find((x) => x[0] === "a" && x[1] === 2)[2], 3000);
 }
 
-// Abort settles queued and running work and leaves no fake timers behind.
+// Abort marks queued work immediately but waits for active launcher cleanup.
 {
   const clock = new FakeClock();
   const controller = new AbortController();
-  const resultPromise = new SwarmBatch([1, 2, 3], () => new Promise(() => {}), { maxConcurrency: 1, clock, signal: controller.signal }).run();
+  let cleaned = false; let settled = false;
+  const resultPromise = new SwarmBatch([1, 2, 3], (_task, context) => new Promise((_resolve, reject) => {
+    context.signal.addEventListener("abort", async () => { await Promise.resolve(); cleaned = true; reject(context.signal.reason); }, { once: true });
+  }), { maxConcurrency: 1, clock, signal: controller.signal }).run();
+  resultPromise.then(() => { settled = true; });
   await flush();
   controller.abort();
+  assert.equal(settled, false);
   const results = await resultPromise;
+  assert.equal(cleaned, true);
   assert.ok(results.every((r) => r.status === "aborted"));
   assert.equal(clock.timers.size, 0);
 }

@@ -1,6 +1,6 @@
 {
   "name": "pi-plugin-swarm",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Kimi-style in-process Luna worker swarm for the Pi coding agent",
   "license": "MIT",
   "keywords": ["pi", "pi-package", "pi-extension", "swarm", "subagent", "multi-agent"],
@@ -17,7 +17,11 @@
     "typecheck": "tsc --noEmit",
     "test:unit": "node --experimental-transform-types test/swarm-batch.test.mjs && node --experimental-transform-types test/swarm-agent-runtime.test.mjs && node --experimental-transform-types test/public-api.test.mjs",
     "smoke": "bash test/smoke.sh",
-    "check": "npm run typecheck && npm run test:unit && npm run smoke"
+    "smoke:packed": "bash test/packed-smoke.sh",
+    "test:live:16": "node --experimental-transform-types test/live-16.mjs",
+    "test:live:abort": "node --experimental-transform-types test/live-abort.mjs",
+    "test:live:resume": "node --experimental-transform-types test/live-resume.mjs",
+    "check": "npm run typecheck && npm run test:unit && npm run smoke && npm run smoke:packed"
   },
   "dependencies": {
     "@earendil-works/pi-agent-core": "0.84.4",

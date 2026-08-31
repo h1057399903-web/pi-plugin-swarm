@@ -2,6 +2,10 @@ export type PublicWorkerStatus = "queued" | "starting" | "running" | "completed"
 
 export interface PublicSwarmWorker {
   workerId: string;
+  /** Stable owner-scoped identity used for follow-up/resume. */
+  agentId: string;
+  resumed: boolean;
+  resumable: boolean;
   index: number;
   item: string;
   status: PublicWorkerStatus;
@@ -40,7 +44,8 @@ export interface PublicSwarmSnapshot {
 
 export type PublicSwarmEvent =
   | { type: "mode"; snapshot: PublicSwarmSnapshot }
-  | { type: "run"; run: PublicSwarmRun; snapshot: PublicSwarmSnapshot };
+  | { type: "run"; run: PublicSwarmRun; snapshot: PublicSwarmSnapshot }
+  | { type: "run_removed"; runId: string; snapshot: PublicSwarmSnapshot };
 
 export interface SwarmIntegration {
   snapshot(): PublicSwarmSnapshot;
@@ -48,6 +53,9 @@ export interface SwarmIntegration {
   setEnabled(enabled: boolean): void;
   updateRun(run: PublicSwarmRun): void;
   removeRun(runId: string): void;
+  clearRuns(): void;
+  setRunController(runId: string, cancel: (() => void) | undefined): void;
+  cancelRun(runId: string): boolean;
 }
 
 const KEY = Symbol.for("pi-plugin-swarm.integration.v1");
@@ -55,12 +63,16 @@ const MAX_RETAINED_RUNS = 20;
 
 type GlobalWithSwarm = typeof globalThis & { [KEY]?: SwarmIntegration };
 
-function cloneWorker(worker: PublicSwarmWorker): PublicSwarmWorker { return { ...worker }; }
+function cloneWorker(worker: PublicSwarmWorker): PublicSwarmWorker {
+  const { output: _output, error: _error, ...safe } = worker;
+  return safe;
+}
 function cloneRun(run: PublicSwarmRun): PublicSwarmRun { return { ...run, workers: run.workers.map(cloneWorker) }; }
 
 class Integration implements SwarmIntegration {
   private enabled = false;
   private readonly runs = new Map<string, PublicSwarmRun>();
+  private readonly controllers = new Map<string, () => void>();
   private readonly listeners = new Set<(event: PublicSwarmEvent) => void>();
 
   snapshot(): PublicSwarmSnapshot {
@@ -91,7 +103,29 @@ class Integration implements SwarmIntegration {
     for (const listener of [...this.listeners]) listener(event);
   }
 
-  removeRun(runId: string): void { this.runs.delete(runId); }
+  removeRun(runId: string): void {
+    if (!this.runs.delete(runId)) return;
+    this.controllers.delete(runId);
+    const event: PublicSwarmEvent = { type: "run_removed", runId, snapshot: this.snapshot() };
+    for (const listener of [...this.listeners]) listener(event);
+  }
+
+  clearRuns(): void {
+    for (const cancel of this.controllers.values()) cancel();
+    this.controllers.clear();
+    for (const runId of [...this.runs.keys()]) this.removeRun(runId);
+  }
+
+  setRunController(runId: string, cancel: (() => void) | undefined): void {
+    if (cancel) this.controllers.set(runId, cancel); else this.controllers.delete(runId);
+  }
+
+  cancelRun(runId: string): boolean {
+    const cancel = this.controllers.get(runId);
+    if (!cancel) return false;
+    cancel();
+    return true;
+  }
 }
 
 export function getSwarmIntegration(): SwarmIntegration {

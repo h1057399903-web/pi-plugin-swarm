@@ -5,6 +5,7 @@ import {
   ModelRuntime,
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
+import { createHash } from "node:crypto";
 import { join, relative, resolve } from "node:path";
 
 export const WORKER_MODEL = "openai-codex/gpt-5.6-luna";
@@ -28,10 +29,10 @@ export interface RuntimeSeams {
   runtimeFactory?: () => Promise<any>;
   sessionFactory?: (options: any) => Promise<{ session: any }>;
   sessionManagerFactory?: (cwd: string, sessionDir?: string) => any;
-  sessionListFactory?: (cwd: string, sessionDir: string) => Promise<any[]>;
-  sessionCreateFactory?: (cwd: string, sessionDir: string) => any;
+  sessionListFactory?: (sessionDir: string) => Promise<any[]>;
+  sessionCreateFactory?: (cwd: string, sessionDir: string, agentId?: string) => any;
   sessionOpenFactory?: (path: string, sessionDir: string, cwd: string) => any;
-  sessionForkFactory?: (path: string, cwd: string, sessionDir: string) => any;
+  sessionForkFactory?: (path: string, cwd: string, sessionDir: string, agentId?: string) => any;
   agentDirFactory?: () => string;
   resourceLoaderFactory?: (cwd: string) => any;
   now?: () => number;
@@ -71,17 +72,19 @@ function isRateLimit(error: unknown): boolean {
 function safeError(error: unknown): string {
   if ((error as any)?.safeMessage) return (error as any).safeMessage;
   if (isRateLimit(error)) return "Provider rate limit.";
-  if (error instanceof Error) return error.name === "AbortError" ? "Aborted." : (error.message || "Worker failed.");
+  if (error instanceof Error) {
+    if (error.name === "AbortError") return "Aborted.";
+    if (["Worker model is unavailable.", "Worker session is unavailable.", "Worker session is busy.", "Worker timed out."].includes(error.message)) return error.message;
+  }
   return "Worker failed.";
 }
 
 const SESSION_UNAVAILABLE = "Worker session is unavailable.";
-function sanitizedOwnerId(ownerSessionId: string): string {
-  const value = ownerSessionId.replace(/[^A-Za-z0-9._-]/g, "_").replace(/^\.+$/, "_");
-  return value || "anonymous";
+function ownerScope(ownerSessionId: string): string {
+  return createHash("sha256").update(ownerSessionId || "anonymous", "utf8").digest("hex").slice(0, 32);
 }
 function sessionDirectory(agentDir: string, ownerSessionId: string): string {
-  return join(agentDir, "swarm", "sessions", sanitizedOwnerId(ownerSessionId));
+  return join(agentDir, "swarm", "sessions", ownerScope(ownerSessionId));
 }
 function isInside(path: string, directory: string): boolean {
   const rel = relative(resolve(directory), resolve(path));
@@ -97,6 +100,7 @@ function unavailable(): Error {
 export class SwarmAgentRuntime {
   private runtimePromise?: Promise<any>;
   private readonly workers = new Map<string, { controller: AbortController; session?: any; cleaned: boolean }>();
+  private readonly activeAgents = new Set<string>();
   private readonly seams: RuntimeSeams;
   constructor(seams: RuntimeSeams = {}) { this.seams = seams; }
 
@@ -108,13 +112,14 @@ export class SwarmAgentRuntime {
     const started = this.seams.now?.() ?? Date.now();
     let agentId = input.agentId || input.workerId;
     const resumable = input.persist === true;
+    const agentKey = resumable && input.agentId ? `${ownerScope(input.ownerSessionId || "anonymous")}:${input.agentId}` : undefined;
     const state = { controller: new AbortController(), cleaned: false, session: undefined as any };
     this.workers.set(input.workerId, state);
-    let status: WorkerStatus = "queued"; let turns = 0; let output = "";
+    let turns = 0; let output = "";
     let lastOutputProgressAt = -Infinity;
     const progressThrottleMs = Math.max(0, this.seams.progressThrottleMs ?? DEFAULT_PROGRESS_THROTTLE_MS);
     const usage: WorkerUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
-    const report = (s: WorkerStatus, chunk?: string) => { status = s; onProgress?.({ workerId: input.workerId, status: s, turns, output: chunk }); };
+    const report = (status: WorkerStatus, chunk?: string) => { onProgress?.({ workerId: input.workerId, status, turns, output: chunk }); };
     const reportOutput = () => {
       const now = this.seams.now?.() ?? Date.now();
       if (now - lastOutputProgressAt < progressThrottleMs) return;
@@ -129,6 +134,10 @@ export class SwarmAgentRuntime {
       timer = setTimeout(() => { timedOut = true; state.controller.abort(new Error("Worker timed out.")); void state.session?.abort?.(); reject(new Error("Worker timed out.")); }, input.timeoutMs);
     }) : undefined;
     try {
+      if (agentKey) {
+        if (this.activeAgents.has(agentKey)) throw Object.assign(new Error("Worker session is busy."), { safeMessage: "Worker session is busy." });
+        this.activeAgents.add(agentKey);
+      }
       const runtime = await this.runtime();
       state.controller.signal.throwIfAborted();
       const model = runtime?.getModel?.("openai-codex", "gpt-5.6-luna") ?? runtime?.getModel?.(WORKER_MODEL);
@@ -146,7 +155,7 @@ export class SwarmAgentRuntime {
         if (input.resume) {
           if (!input.agentId) throw unavailable();
           try {
-            const sessions = await (this.seams.sessionListFactory || ((cwd, dir) => SessionManager.list(cwd, dir)))(input.cwd, ownerDir);
+            const sessions = await (this.seams.sessionListFactory || ((dir) => SessionManager.listAll(dir)))(ownerDir);
             const match = sessions.find((session: any) => session?.id === input.agentId && typeof session.path === "string" && isInside(session.path, ownerDir));
             if (!match) throw unavailable();
             sessionManager = this.seams.sessionOpenFactory?.(match.path, ownerDir, input.cwd) ?? SessionManager.open(match.path, ownerDir, input.cwd);
@@ -155,10 +164,9 @@ export class SwarmAgentRuntime {
             throw unavailable();
           }
         } else if (input.forkSessionFile) {
-          if (!isInside(input.forkSessionFile, ownerDir)) throw unavailable();
-          sessionManager = this.seams.sessionForkFactory?.(input.forkSessionFile, input.cwd, ownerDir) ?? SessionManager.forkFrom(input.forkSessionFile, input.cwd, ownerDir);
+          sessionManager = this.seams.sessionForkFactory?.(input.forkSessionFile, input.cwd, ownerDir, input.agentId) ?? SessionManager.forkFrom(input.forkSessionFile, input.cwd, ownerDir, { id: input.agentId });
         } else {
-          sessionManager = this.seams.sessionCreateFactory?.(input.cwd, ownerDir) ?? SessionManager.create(input.cwd, ownerDir);
+          sessionManager = this.seams.sessionCreateFactory?.(input.cwd, ownerDir, input.agentId) ?? SessionManager.create(input.cwd, ownerDir, { id: input.agentId });
         }
       }
       if (resumable && !input.agentId) agentId = sessionManager.getSessionId?.() || agentId;
@@ -193,6 +201,7 @@ export class SwarmAgentRuntime {
       return { workerId: input.workerId, agentId, resumable, status: resultStatus, startedAt: started, finishedAt: finished, durationMs: finished - started, turns, usage, output: cap(output), error: timedOut ? "Worker timed out." : safeError(error) };
     } finally {
       if (timer) clearTimeout(timer);
+      if (agentKey) this.activeAgents.delete(agentKey);
       await this.cleanup(input.workerId);
     }
   }

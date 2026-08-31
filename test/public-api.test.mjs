@@ -14,18 +14,25 @@ integration.updateRun({
   requestedConcurrency: 2,
   activeCapacity: 2,
   workers: [{
-    workerId: "worker-1", index: 0, item: "one", status: "running", attempt: 1,
+    workerId: "worker-1", agentId: "agent-1", resumed: false, resumable: true, index: 0, item: "one", status: "running", attempt: 1,
     turns: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cost: 0,
-    model: "openai-codex/gpt-5.6-luna", thinking: "medium",
+    model: "openai-codex/gpt-5.6-luna", thinking: "medium", output: "private transcript", error: "private error",
   }],
 });
 const snapshot = integration.snapshot();
 assert.equal(snapshot.enabled, true);
 assert.equal(snapshot.runs.length, 1);
 assert.equal(snapshot.runs[0].workers[0].workerId, "worker-1");
+assert.equal(snapshot.runs[0].workers[0].output, undefined);
+assert.equal(snapshot.runs[0].workers[0].error, undefined);
 snapshot.runs[0].workers[0].status = "failed";
 assert.equal(integration.snapshot().runs[0].workers[0].status, "running", "snapshots must be defensive clones");
-assert.deepEqual(events.map((event) => event.type), ["mode", "run"]);
-unsubscribe();
+let cancelled = 0;
+integration.setRunController("run-1", () => cancelled++);
+assert.equal(integration.cancelRun("run-1"), true);
+assert.equal(cancelled, 1);
 integration.removeRun("run-1");
+assert.equal(integration.cancelRun("run-1"), false);
+assert.deepEqual(events.map((event) => event.type), ["mode", "run", "run_removed"]);
+unsubscribe();
 console.log("SWARM_PUBLIC_API_TEST_OK");
