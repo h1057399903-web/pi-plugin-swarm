@@ -1,5 +1,10 @@
 import assert from "node:assert/strict";
-import registerSwarmExtension from "../src/index.ts";
+import registerSwarmExtension, { resolveSwarmConcurrency } from "../src/index.ts";
+
+assert.equal(resolveSwarmConcurrency(1), 1);
+assert.equal(resolveSwarmConcurrency(8), 8);
+assert.equal(resolveSwarmConcurrency(128), 16);
+assert.equal(resolveSwarmConcurrency(8, 3), 3);
 
 function fakePi() {
   const handlers = new Map(); const commands = []; const tools = [];

@@ -20,7 +20,7 @@ Then restart Pi or run `/reload`.
 /swarm <task>
 ```
 
-The model can call the `swarm` tool with 1–128 bounded work packages. Default concurrency is 2; callers may request up to 16. Completed workers return stable `agentId` values and can be resumed with `resume_agent_ids`. New workers can set `fork: true` when every task genuinely requires the completed parent conversation.
+The model can call the `swarm` tool with 1–128 bounded work packages. Default concurrency is adaptive (`min(total workers, 16)`); callers may request a lower or explicit limit up to 16. Completed workers return stable `agentId` values and can be resumed with `resume_agent_ids`. New workers can set `fork: true` when every task genuinely requires the completed parent conversation.
 
 ## Runtime model
 

@@ -7,7 +7,6 @@ import { SwarmAgentRuntime, WORKER_MODEL, WORKER_THINKING_LEVEL, type WorkerResu
 import { getSwarmIntegration, type PublicSwarmRun, type PublicSwarmWorker } from "./public-api.ts";
 
 const MAX_TASKS = 128;
-const DEFAULT_CONCURRENCY = 2;
 const MAX_CONCURRENCY = 16;
 const INITIAL_LAUNCH_LIMIT = 5;
 const LAUNCH_STAGGER_MS = 700;
@@ -35,8 +34,12 @@ const SwarmParameters = Type.Object({
   fork: Type.Optional(Type.Boolean({ description: "Fork the current parent conversation into every new worker; incompatible with resume agent IDs" })),
   promptTemplate: Type.Optional(Type.String({ description: "Template for tasks without prompt; replace {{item}}" })),
   prompt_template: Type.Optional(Type.String({ description: "Kimi-compatible alias for promptTemplate" })),
-  concurrency: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_CONCURRENCY, description: "Maximum active workers; defaults to 2" })),
+  concurrency: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_CONCURRENCY, description: "Maximum active workers; defaults to min(total workers, 16)" })),
 });
+
+export function resolveSwarmConcurrency(totalWorkers: number, requested?: number): number {
+  return Math.max(1, Math.min(requested ?? totalWorkers, MAX_CONCURRENCY));
+}
 
 function safeError(value: unknown): string {
   if (value instanceof Error && ["Worker failed.", "Worker timed out.", "Worker session is unavailable.", "Worker session is busy.", "Provider rate limit."].includes(value.message)) return value.message;
@@ -94,7 +97,7 @@ export function registerSwarmExtension(pi: ExtensionAPI): void {
 
   pi.on("before_agent_start", (event) => {
     if (!enabled) return;
-    return { systemPrompt: `${event.systemPrompt}\n\nSWARM MODE IS ACTIVE. Coordinate bounded independent work through the swarm tool. Prefer one worker; parallelize only non-overlapping packages. Workers use Luna medium. Inspect their changes and tests yourself. Never delegate credentials, production mutation, deployments, service restarts, device installation, merges, or overlapping edits.` };
+    return { systemPrompt: `${event.systemPrompt}\n\nSWARM MODE IS ACTIVE. Use the swarm tool when work can be split into useful bounded packages. Run as many packages concurrently as are genuinely independent; use one worker only for a single or serial package. Workers use Luna medium. Inspect their changes and tests yourself. Never delegate credentials, production mutation, deployments, service restarts, device installation, merges, or overlapping edits.` };
   });
 
   pi.registerCommand("swarm", {
@@ -108,7 +111,7 @@ export function registerSwarmExtension(pi: ExtensionAPI): void {
       }
       if (lower === "status") {
         const active = integration.snapshot().runs.filter((run) => run.status === "running").length;
-        ctx.ui.notify(`Swarm ${enabled ? "ON" : "OFF"} · ${WORKER_MODEL} · ${WORKER_THINKING_LEVEL} · default ${DEFAULT_CONCURRENCY} · max tasks ${MAX_TASKS} · active runs ${active}`, "info"); return;
+        ctx.ui.notify(`Swarm ${enabled ? "ON" : "OFF"} · ${WORKER_MODEL} · ${WORKER_THINKING_LEVEL} · default adaptive up to ${MAX_CONCURRENCY} · max tasks ${MAX_TASKS} · active runs ${active}`, "info"); return;
       }
       if (lower.startsWith("cancel ")) {
         const runId = args.slice(7).trim();
@@ -126,7 +129,7 @@ export function registerSwarmExtension(pi: ExtensionAPI): void {
     description: `Launch or resume a Kimi-style bounded task swarm using in-process Pi AgentSessions. Supports 1-${MAX_TASKS} tasks, up to ${MAX_CONCURRENCY} active workers, stable resumable agent IDs, optional parent-context fork, initial burst ${INITIAL_LAUNCH_LIMIT}, then staggered launches. Workers always use ${WORKER_MODEL} at ${WORKER_THINKING_LEVEL}.`,
     promptSnippet: "Delegate bounded independent packages to in-process Luna workers",
     promptGuidelines: [
-      "Prefer one worker; parallelize only independent packages with non-overlapping file ownership.",
+      "Use as many workers as are useful for independent packages with non-overlapping file ownership; use one only for a single or serial package.",
       "Never delegate credentials, production mutations, deployments, service restarts, device installation, or merges.",
       "Inspect worker changes and verification evidence before accepting them.",
       "Use resume_agent_ids for follow-up work by a prior worker; use fork only when every new worker requires the parent conversation context.",
@@ -147,7 +150,7 @@ export function registerSwarmExtension(pi: ExtensionAPI): void {
       const forkSessionFile = params.fork ? parentSessionFile : undefined;
       if (params.fork && !forkSessionFile) throw new Error("Fork requires a persisted parent session");
       if (resumedTasks.length && !resumable) throw new Error("Resume requires a persisted parent session");
-      const requestedConcurrency = Math.min(params.concurrency ?? DEFAULT_CONCURRENCY, MAX_CONCURRENCY);
+      const requestedConcurrency = resolveSwarmConcurrency(tasks.length, params.concurrency);
       const runId = randomUUID();
       const workers = tasks.map((task, index) => makeWorker(runId, task, index, resumable));
       const run: PublicSwarmRun = { runId, description: params.description.slice(0, 500), status: "running", createdAt: Date.now(), requestedConcurrency, activeCapacity: requestedConcurrency, workers };

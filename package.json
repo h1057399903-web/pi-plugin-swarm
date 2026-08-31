@@ -1,6 +1,6 @@
 {
   "name": "pi-plugin-swarm",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Kimi-style in-process Luna worker swarm for the Pi coding agent",
   "license": "MIT",
   "keywords": ["pi", "pi-package", "pi-extension", "swarm", "subagent", "multi-agent"],
