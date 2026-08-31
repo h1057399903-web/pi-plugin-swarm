@@ -1,0 +1,29 @@
+{
+  "name": "pi-plugin-swarm",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cost-controlled coordinator and isolated Luna worker swarm for the Pi coding agent",
+  "keywords": ["pi", "pi-package", "pi-extension", "swarm", "subagent", "multi-agent"],
+  "type": "module",
+  "engines": {"node": ">=22.19.0"},
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "smoke": "bash test/smoke.sh",
+    "check": "npm run typecheck && npm run smoke"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-agent-core": "0.84.4",
+    "@earendil-works/pi-coding-agent": "0.84.4",
+    "@earendil-works/pi-tui": "0.84.4",
+    "@types/node": "^22.15.0",
+    "typebox": "^1.0.0",
+    "typescript": "^5.9.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "pi": {"extensions": ["./src/index.ts"]}
+}
