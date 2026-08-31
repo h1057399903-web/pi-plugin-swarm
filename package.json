@@ -6,7 +6,7 @@
   "keywords": ["pi", "pi-package", "pi-extension", "swarm", "subagent", "multi-agent"],
   "type": "module",
   "engines": {"node": ">=22.19.0"},
-  "files": ["src", "test", "README.md", "SECURITY.md", "LICENSE", "THIRD-PARTY-NOTICES.md"],
+  "files": ["src", "test", "README.md", "README.zh-CN.md", "SECURITY.md", "LICENSE", "THIRD-PARTY-NOTICES.md"],
   "exports": {
     ".": "./src/index.ts",
     "./core": "./src/public-api.ts",

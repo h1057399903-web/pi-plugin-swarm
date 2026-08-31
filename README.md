@@ -1,5 +1,7 @@
 # pi-plugin-swarm
 
+English | [简体中文](README.zh-CN.md)
+
 A standalone, MIT-licensed Pi extension for coordinator-driven parallel work. It uses in-process Pi `AgentSession` workers fixed to `openai-codex/gpt-5.6-luna` with `medium` thinking, including 16-way concurrency, stable agent IDs, follow-up resume, and optional parent-context fork.
 
 ## Install
@@ -9,6 +11,16 @@ pi install git:github.com/h1057399903-web/pi-plugin-swarm
 ```
 
 Then restart Pi or run `/reload`.
+
+## Requirements and usage notes
+
+- Node.js 22.19 or newer is required. The current release is tested with Pi 0.84.4.
+- Workers are fixed to `openai-codex/gpt-5.6-luna` with `medium` thinking. Your normal Pi credential store must have access to that model; this package does not include or manage credentials.
+- Parallel model calls consume provider quota. A 16-worker run can use substantially more tokens and requests than a single-agent task, so delegate only work that benefits from independent lanes.
+- Workers run under the same operating-system account and workspace permissions as the parent Pi. Install and run the package only in trusted workspaces, and review worker changes before accepting them.
+- `npm run check` uses offline unit and packaging tests and does not call a model. The `test:live:*` scripts make real networked model calls and may consume quota.
+
+No npm publication or GitHub Release is required. Installing directly from this repository is the supported distribution path.
 
 ## Commands
 
