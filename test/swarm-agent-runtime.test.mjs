@@ -145,4 +145,27 @@ function sessionFor(text, delay = 0) {
   assert.equal(Buffer.byteLength(result.output), MAX_OUTPUT_BYTES);
 }
 
+// timeout covers runtime/session setup and does not leave a rejected promise unobserved
+{
+  const r = new SwarmAgentRuntime({ runtimeFactory: () => new Promise(() => {}) });
+  const result = await r.run({ workerId: "setup-timeout", prompt: "x", cwd: "/tmp", timeoutMs: 10 });
+  assert.equal(result.status, "failed");
+  assert.equal(result.error, "Worker timed out.");
+}
+
+// a session created after timeout is immediately disposed instead of leaking
+{
+  let lateSession;
+  const r = new SwarmAgentRuntime(seams(() => (lateSession = sessionFor("late")), {
+    sessionFactory: async (options) => {
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      return { session: (lateSession = sessionFor("late")) };
+    },
+  }));
+  const result = await r.run({ workerId: "late-session", prompt: "x", cwd: "/tmp", timeoutMs: 10 });
+  assert.equal(result.status, "failed");
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  assert.equal(lateSession.disposed, true);
+}
+
 console.log("SWARM_AGENT_RUNTIME_TEST_OK");

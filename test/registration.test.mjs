@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
-import registerSwarmExtension, { resolveSwarmConcurrency } from "../src/index.ts";
+import registerSwarmExtension, { countSwarmWorkers, resolveSwarmConcurrency } from "../src/index.ts";
 
 assert.equal(resolveSwarmConcurrency(1), 1);
 assert.equal(resolveSwarmConcurrency(8), 8);
 assert.equal(resolveSwarmConcurrency(128), 16);
 assert.equal(resolveSwarmConcurrency(8, 3), 3);
+assert.equal(countSwarmWorkers({ tasks: [1], items: [2, 3] }), 3);
+assert.equal(countSwarmWorkers({ resume_agent_ids: { a: "x" }, resumeAgentIds: { a: "override", b: "y" } }), 2);
 
 function fakePi() {
   const handlers = new Map(); const commands = []; const tools = [];

@@ -3,6 +3,9 @@ import { getSwarmIntegration } from "../src/public-api.ts";
 
 const integration = getSwarmIntegration();
 for (const run of integration.snapshot().runs) integration.removeRun(run.runId);
+const badListener = integration.subscribe(() => { throw new Error("observer failure"); });
+assert.doesNotThrow(() => integration.setEnabled(false), "optional observers must not break producers");
+badListener();
 const events = [];
 const unsubscribe = integration.subscribe((event) => events.push(event));
 integration.setEnabled(true);

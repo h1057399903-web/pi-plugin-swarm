@@ -133,63 +133,73 @@ export class SwarmAgentRuntime {
     const timeout = input.timeoutMs && input.timeoutMs > 0 ? new Promise<never>((_, reject) => {
       timer = setTimeout(() => { timedOut = true; state.controller.abort(new Error("Worker timed out.")); void state.session?.abort?.(); reject(new Error("Worker timed out.")); }, input.timeoutMs);
     }) : undefined;
+    let unsubscribe: (() => void) | undefined;
     try {
       if (agentKey) {
         if (this.activeAgents.has(agentKey)) throw Object.assign(new Error("Worker session is busy."), { safeMessage: "Worker session is busy." });
         this.activeAgents.add(agentKey);
       }
-      const runtime = await this.runtime();
-      state.controller.signal.throwIfAborted();
-      const model = runtime?.getModel?.("openai-codex", "gpt-5.6-luna") ?? runtime?.getModel?.(WORKER_MODEL);
-      if (!model) throw new Error("Worker model is unavailable.");
-      const loader = this.seams.resourceLoaderFactory?.(input.cwd) ?? new DefaultResourceLoader({
-        cwd: input.cwd, agentDir: getAgentDir(), noExtensions: true, noPromptTemplates: true, noThemes: true,
-        noSkills: true, noContextFiles: true, appendSystemPrompt: [SAFETY_POLICY],
-      });
-      await (loader as { reload?: () => Promise<void> }).reload?.();
-      let sessionManager: any;
-      if (!resumable) {
-        sessionManager = this.seams.sessionManagerFactory?.(input.cwd) ?? SessionManager.inMemory(input.cwd);
-      } else {
-        const ownerDir = sessionDirectory(this.seams.agentDirFactory?.() ?? getAgentDir(), input.ownerSessionId || "anonymous");
-        if (input.resume) {
-          if (!input.agentId) throw unavailable();
-          try {
-            const sessions = await (this.seams.sessionListFactory || ((dir) => SessionManager.listAll(dir)))(ownerDir);
-            const match = sessions.find((session: any) => session?.id === input.agentId && typeof session.path === "string" && isInside(session.path, ownerDir));
-            if (!match) throw unavailable();
-            sessionManager = this.seams.sessionOpenFactory?.(match.path, ownerDir, input.cwd) ?? SessionManager.open(match.path, ownerDir, input.cwd);
-          } catch (error) {
-            if ((error as any)?.safeMessage) throw error;
-            throw unavailable();
-          }
-        } else if (input.forkSessionFile) {
-          sessionManager = this.seams.sessionForkFactory?.(input.forkSessionFile, input.cwd, ownerDir, input.agentId) ?? SessionManager.forkFrom(input.forkSessionFile, input.cwd, ownerDir, { id: input.agentId });
-        } else {
-          sessionManager = this.seams.sessionCreateFactory?.(input.cwd, ownerDir, input.agentId) ?? SessionManager.create(input.cwd, ownerDir, { id: input.agentId });
-        }
-      }
-      if (resumable && !input.agentId) agentId = sessionManager.getSessionId?.() || agentId;
-      const created = await (this.seams.sessionFactory || createAgentSession)({
-        cwd: input.cwd, modelRuntime: runtime, model, thinkingLevel: WORKER_THINKING_LEVEL,
-        sessionManager, resourceLoader: loader, tools: ["read", "bash", "edit", "write"],
-      });
-      state.session = created.session;
-      const unsubscribe = state.session.subscribe?.((event: any) => {
-        if (event.type === "turn_start") { turns++; report("running"); }
-        if (event.type === "message_update") {
-          const delta = event.assistantMessageEvent?.delta || ""; if (delta) { output += delta; reportOutput(); }
-        }
-        if (event.type === "message_end" && event.message?.role === "assistant") { output = textOf(event.message.content) || output; addUsage(usage, usageOf(event.message)); }
-      });
-      report("running");
-      const prompt = input.prompt;
       const aborted = new Promise<never>((_, reject) => state.controller.signal.addEventListener("abort", () => reject(state.controller.signal.reason || new Error("Aborted.")), { once: true }));
-      const operation = state.session.prompt(prompt, { signal: state.controller.signal });
+      const operation = (async () => {
+        const runtime = await this.runtime();
+        state.controller.signal.throwIfAborted();
+        const model = runtime?.getModel?.("openai-codex", "gpt-5.6-luna") ?? runtime?.getModel?.(WORKER_MODEL);
+        if (!model) throw new Error("Worker model is unavailable.");
+        const loader = this.seams.resourceLoaderFactory?.(input.cwd) ?? new DefaultResourceLoader({
+          cwd: input.cwd, agentDir: getAgentDir(), noExtensions: true, noPromptTemplates: true, noThemes: true,
+          noSkills: true, noContextFiles: true, appendSystemPrompt: [SAFETY_POLICY],
+        });
+        await (loader as { reload?: () => Promise<void> }).reload?.();
+        state.controller.signal.throwIfAborted();
+        let sessionManager: any;
+        if (!resumable) {
+          sessionManager = this.seams.sessionManagerFactory?.(input.cwd) ?? SessionManager.inMemory(input.cwd);
+        } else {
+          const ownerDir = sessionDirectory(this.seams.agentDirFactory?.() ?? getAgentDir(), input.ownerSessionId || "anonymous");
+          if (input.resume) {
+            if (!input.agentId) throw unavailable();
+            try {
+              const sessions = await (this.seams.sessionListFactory || ((dir) => SessionManager.listAll(dir)))(ownerDir);
+              state.controller.signal.throwIfAborted();
+              const match = sessions.find((session: any) => session?.id === input.agentId && typeof session.path === "string" && isInside(session.path, ownerDir));
+              if (!match) throw unavailable();
+              sessionManager = this.seams.sessionOpenFactory?.(match.path, ownerDir, input.cwd) ?? SessionManager.open(match.path, ownerDir, input.cwd);
+            } catch (error) {
+              if (state.controller.signal.aborted) throw state.controller.signal.reason;
+              if ((error as any)?.safeMessage) throw error;
+              throw unavailable();
+            }
+          } else if (input.forkSessionFile) {
+            sessionManager = this.seams.sessionForkFactory?.(input.forkSessionFile, input.cwd, ownerDir, input.agentId) ?? SessionManager.forkFrom(input.forkSessionFile, input.cwd, ownerDir, { id: input.agentId });
+          } else {
+            sessionManager = this.seams.sessionCreateFactory?.(input.cwd, ownerDir, input.agentId) ?? SessionManager.create(input.cwd, ownerDir, { id: input.agentId });
+          }
+        }
+        state.controller.signal.throwIfAborted();
+        if (resumable && !input.agentId) agentId = sessionManager.getSessionId?.() || agentId;
+        const created = await (this.seams.sessionFactory || createAgentSession)({
+          cwd: input.cwd, modelRuntime: runtime, model, thinkingLevel: WORKER_THINKING_LEVEL,
+          sessionManager, resourceLoader: loader, tools: ["read", "bash", "edit", "write"],
+        });
+        state.session = created.session;
+        if (state.controller.signal.aborted) {
+          try { await Promise.resolve(state.session?.dispose?.()); } finally { state.session = undefined; }
+          state.controller.signal.throwIfAborted();
+        }
+        unsubscribe = state.session.subscribe?.((event: any) => {
+          if (event.type === "turn_start") { turns++; report("running"); }
+          if (event.type === "message_update") {
+            const delta = event.assistantMessageEvent?.delta || ""; if (delta) { output += delta; reportOutput(); }
+          }
+          if (event.type === "message_end" && event.message?.role === "assistant") { output = textOf(event.message.content) || output; addUsage(usage, usageOf(event.message)); }
+        });
+        report("running");
+        await state.session.prompt(input.prompt, { signal: state.controller.signal });
+        state.controller.signal.throwIfAborted();
+      })();
       await Promise.race([operation, aborted, ...(timeout ? [timeout] : [])]);
-      state.controller.signal.throwIfAborted();
       if (!output) { const messages = state.session.messages || state.session.agent?.state?.messages || []; for (let i = messages.length - 1; i >= 0; i--) if (messages[i]?.role === "assistant") { output = textOf(messages[i].content); addUsage(usage, usageOf(messages[i])); break; } }
-      unsubscribe?.(); report("completed");
+      report("completed");
       const finished = this.seams.now?.() ?? Date.now();
       return { workerId: input.workerId, agentId, resumable, status: "completed", startedAt: started, finishedAt: finished, durationMs: finished - started, turns, usage, output: cap(output) };
     } catch (error) {
@@ -201,6 +211,7 @@ export class SwarmAgentRuntime {
       return { workerId: input.workerId, agentId, resumable, status: resultStatus, startedAt: started, finishedAt: finished, durationMs: finished - started, turns, usage, output: cap(output), error: timedOut ? "Worker timed out." : safeError(error) };
     } finally {
       if (timer) clearTimeout(timer);
+      unsubscribe?.();
       if (agentKey) this.activeAgents.delete(agentKey);
       await this.cleanup(input.workerId);
     }

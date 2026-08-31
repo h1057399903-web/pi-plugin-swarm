@@ -40,6 +40,14 @@ export function resolveSwarmConcurrency(totalWorkers: number, requested?: number
   return Math.max(1, Math.min(requested ?? totalWorkers, MAX_CONCURRENCY));
 }
 
+export function countSwarmWorkers(args: {
+  tasks?: readonly unknown[]; items?: readonly unknown[];
+  resumeAgentIds?: Readonly<Record<string, unknown>>; resume_agent_ids?: Readonly<Record<string, unknown>>;
+}): number {
+  const resumed = { ...(args.resume_agent_ids ?? {}), ...(args.resumeAgentIds ?? {}) };
+  return (args.tasks?.length ?? 0) + (args.items?.length ?? 0) + Object.keys(resumed).length;
+}
+
 function safeError(value: unknown): string {
   if (value instanceof Error && ["Worker failed.", "Worker timed out.", "Worker session is unavailable.", "Worker session is busy.", "Provider rate limit."].includes(value.message)) return value.message;
   return "Worker failed.";
@@ -242,7 +250,7 @@ export function registerSwarmExtension(pi: ExtensionAPI): void {
       return { content: [{ type: "text", text: `Swarm completed: ${completed}/${workers.length} succeeded\n\n${summaries.join("\n\n---\n\n")}` }], details: structuredClone(run) };
     },
     renderCall(args, theme) {
-      const count = args.tasks?.length ?? 0;
+      const count = countSwarmWorkers(args);
       return new Text(`${theme.fg("toolTitle", theme.bold("swarm "))}${theme.fg("accent", `${count} worker${count === 1 ? "" : "s"}`)}\n${theme.fg("dim", args.description ?? "")}`, 0, 0);
     },
     renderResult(result, { isPartial }, theme) {

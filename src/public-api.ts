@@ -89,10 +89,16 @@ class Integration implements SwarmIntegration {
     return () => this.listeners.delete(listener);
   }
 
+  private emit(event: PublicSwarmEvent): void {
+    for (const listener of [...this.listeners]) {
+      try { listener(event); } catch { /* Optional observers cannot break the swarm runtime. */ }
+    }
+  }
+
   setEnabled(enabled: boolean): void {
     this.enabled = enabled;
     const event: PublicSwarmEvent = { type: "mode", snapshot: this.snapshot() };
-    for (const listener of [...this.listeners]) listener(event);
+    this.emit(event);
   }
 
   updateRun(run: PublicSwarmRun): void {
@@ -100,14 +106,14 @@ class Integration implements SwarmIntegration {
     this.runs.set(run.runId, cloneRun(run));
     while (this.runs.size > MAX_RETAINED_RUNS) this.runs.delete(this.runs.keys().next().value!);
     const event: PublicSwarmEvent = { type: "run", run: cloneRun(run), snapshot: this.snapshot() };
-    for (const listener of [...this.listeners]) listener(event);
+    this.emit(event);
   }
 
   removeRun(runId: string): void {
     if (!this.runs.delete(runId)) return;
     this.controllers.delete(runId);
     const event: PublicSwarmEvent = { type: "run_removed", runId, snapshot: this.snapshot() };
-    for (const listener of [...this.listeners]) listener(event);
+    this.emit(event);
   }
 
   clearRuns(): void {
