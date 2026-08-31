@@ -17,6 +17,8 @@ function fakePi() {
   };
 }
 
+// A long-running Pi may retain the legacy boolean marker from v0.3.0.
+globalThis[Symbol.for("pi-plugin-swarm.extension.registered.v2")] = true;
 const first = fakePi();
 registerSwarmExtension(first);
 registerSwarmExtension(first);
