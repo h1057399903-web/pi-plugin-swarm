@@ -7,6 +7,7 @@ function seams(makeSession, extra = {}) {
   return {
     runtimeFactory: async () => { runtimes++; return { getModel: () => model }; },
     sessionManagerFactory: (cwd) => ({ cwd }),
+    resourceLoaderFactory: () => ({ reload: async () => {} }),
     sessionFactory: async (options) => ({ session: makeSession(options) }),
     ...extra,
     get runtimeCount() { return runtimes; },

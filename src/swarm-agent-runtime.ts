@@ -31,7 +31,7 @@ const SAFETY_POLICY = [
   "You are an in-process swarm worker. Work only on the supplied prompt and report the final answer.",
   "Never persist or resume a session; never load extensions, skills, prompt templates, themes, or project context files.",
   "Never reveal credentials, environment secrets, tokens, or private request data.",
-  "Do not spawn OS processes and do not use shell or process-execution capabilities.",
+  "Use read, bash, edit, and write only inside the delegated working directory. Never start subagents, deploy, restart services, mutate production, install devices, merge pull requests, or handle credentials.",
 ].join("\n");
 
 function textOf(content: unknown): string {
@@ -86,7 +86,7 @@ export class SwarmAgentRuntime {
     let timer: ReturnType<typeof setTimeout> | undefined;
     let timedOut = false;
     const timeout = input.timeoutMs && input.timeoutMs > 0 ? new Promise<never>((_, reject) => {
-      timer = setTimeout(() => { timedOut = true; state.controller.abort(new Error("Worker timed out.")); reject(new Error("Worker timed out.")); }, input.timeoutMs);
+      timer = setTimeout(() => { timedOut = true; state.controller.abort(new Error("Worker timed out.")); void state.session?.abort?.(); reject(new Error("Worker timed out.")); }, input.timeoutMs);
     }) : undefined;
     try {
       const runtime = await this.runtime();
@@ -97,10 +97,11 @@ export class SwarmAgentRuntime {
         cwd: input.cwd, agentDir: getAgentDir(), noExtensions: true, noPromptTemplates: true, noThemes: true,
         noSkills: true, noContextFiles: true, appendSystemPrompt: [SAFETY_POLICY],
       });
+      await (loader as { reload?: () => Promise<void> }).reload?.();
       const sessionManager = this.seams.sessionManagerFactory?.(input.cwd) ?? SessionManager.inMemory(input.cwd);
       const created = await (this.seams.sessionFactory || createAgentSession)({
         cwd: input.cwd, modelRuntime: runtime, model, thinkingLevel: WORKER_THINKING_LEVEL,
-        sessionManager, resourceLoader: loader, noTools: "all",
+        sessionManager, resourceLoader: loader, tools: ["read", "bash", "edit", "write"],
       });
       state.session = created.session;
       const unsubscribe = state.session.subscribe?.((event: any) => {

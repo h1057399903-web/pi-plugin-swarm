@@ -1,18 +1,6 @@
-# Pi Plugin Swarm
+# pi-plugin-swarm
 
-A private Pi package that adds coordinator-driven, cost-controlled worker swarms to the Pi coding agent.
-
-## Behavior
-
-- `/swarm on`, `/swarm off`, `/swarm status`, and `/swarm <task>`
-- `swarm` tool with 1–8 isolated worker processes
-- workers are pinned to `openai-codex/gpt-5.6-luna` with `medium` thinking
-- default concurrency 2; hard maximum 4
-- streaming progress, per-worker token/cost details, and abort propagation
-- coordinator guidance prefers one worker and rejects unnecessary duplicate review lanes
-- worker prompt forbids recursive delegation and keeps deployment, production writes, device operations, merges, and credential handling with the parent
-
-This reproduces the useful Pi-side workflow of a swarm, but it uses isolated Pi subprocesses rather than Kimi Code's internal swarm service.
+A standalone, MIT-licensed Pi extension for coordinator-driven parallel work. It uses in-process, non-persistent Pi `AgentSession` workers fixed to `openai-codex/gpt-5.6-luna` with `medium` thinking.
 
 ## Install
 
@@ -20,27 +8,46 @@ This reproduces the useful Pi-side workflow of a swarm, but it uses isolated Pi 
 pi install git:github.com/h1057399903-web/pi-plugin-swarm
 ```
 
-Because the repository is private, the machine must already have GitHub access. Restart Pi after installation.
+Then restart Pi or run `/reload`.
 
-## Use
+## Commands
 
 ```text
 /swarm on
-/swarm status
-/swarm implement the bounded change; use only necessary workers
 /swarm off
+/swarm status
+/swarm <task>
 ```
 
-The parent Pi remains responsible for decomposition, conflict avoidance, diff review, integration, and safety decisions.
+The model can call the `swarm` tool with 1–128 bounded work packages. Default concurrency is 2; callers may request up to 16.
 
-## Development
+## Runtime model
 
-```bash
-npm install
-npm run check
-pi -e ./src/index.ts
-```
+Inspired by Kimi Code's public MIT-licensed swarm scheduler:
 
-## Security
+- up to 128 queued tasks;
+- initial burst of up to 5 workers;
+- later workers start at 700 ms intervals;
+- provider rate limits requeue with exponential backoff;
+- active capacity shrinks on rate limits and recovers gradually;
+- batch cancellation propagates to running workers;
+- stable task/result ordering.
 
-The repository contains no credentials and does not read external credential files. Worker processes inherit only the normal Pi runtime environment needed to access the configured model. Do not delegate secrets, production mutation, deployment, service restart, device installation, or merge authority to workers.
+Unlike v0.1, workers do not start complete Pi CLI child processes. They use the official Pi SDK in the host process with:
+
+- one shared `ModelRuntime`;
+- one isolated `SessionManager.inMemory()` per worker;
+- no persisted worker sessions;
+- no extension recursion;
+- `read`, `bash`, `edit`, and `write` coding tools;
+- bounded public output and usage accounting.
+
+## Workbench integration
+
+The package exports `pi-plugin-swarm/core`, a process-level singleton event API. Other Pi packages can subscribe to safe run/worker snapshots without reading worker transcripts, credentials, or session files. Registration is idempotent through `Symbol.for(...)`, so a host and the standalone extension do not register duplicate `/swarm` commands.
+
+## Safety
+
+Do not delegate credentials, production mutations, deployments, service restarts, device installation, or merges. Parallel workers should own non-overlapping files. The coordinator remains responsible for reviewing diffs and running final verification.
+
+See [SECURITY.md](SECURITY.md) and [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).

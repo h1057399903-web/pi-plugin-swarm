@@ -77,7 +77,7 @@ const flush = () => new Promise((resolve) => queueMicrotask(resolve));
     if (task === "a" && context.attempt === 1) throw new Error("429");
     return task;
   }, { maxConcurrency: 2, initialLaunchLimit: 2, launchStaggerMs: 0, retryBaseMs: 3_000, capacityRecoveryMs: 10_000, maxRetries: 2, clock,
-    isRateLimitedError: (error) => error.message === "429" });
+    isRateLimitedError: (error) => error.message === "429" }).run();
   await flush();
   assert.equal(attempts.length, 2);
   await clock.tick(2999);

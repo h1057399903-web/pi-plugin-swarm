@@ -168,20 +168,28 @@ export class SwarmBatch<T, R> {
     this.active.set(state.index, controller);
     state.status = "running";
     this.emit();
-    void this.withTimeout(() => this.launcher(state.task, context), controller.signal).then(
+    void this.withTimeout(() => this.launcher(state.task, context), controller).then(
       (value) => this.outcome(state, context, value),
       (error) => this.failure(state, context, error),
     );
   }
 
-  private async withTimeout(fn: () => Promise<R> | R, signal: AbortSignal): Promise<R> {
+  private async withTimeout(fn: () => Promise<R> | R, controller: AbortController): Promise<R> {
+    const signal = controller.signal;
     if (!this.timeoutMs) {
       if (signal.aborted) throw signal.reason ?? new Error("Aborted");
       return fn();
     }
     return new Promise<R>((resolve, reject) => {
       let done = false;
-      const timer = this.addTimer(() => { if (!done) { done = true; signal.removeEventListener("abort", onAbort); reject(new Error("Task timed out.")); } }, this.timeoutMs);
+      const timer = this.addTimer(() => {
+        if (!done) {
+          done = true;
+          signal.removeEventListener("abort", onAbort);
+          controller.abort(new Error("Task timed out."));
+          reject(new Error("Task timed out."));
+        }
+      }, this.timeoutMs);
       const settle = (callback: () => void) => {
         if (done) return;
         done = true;
