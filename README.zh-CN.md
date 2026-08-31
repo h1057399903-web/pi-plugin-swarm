@@ -12,6 +12,22 @@ pi install git:github.com/h1057399903-web/pi-plugin-swarm
 
 然后重新启动 Pi，或运行 `/reload`。
 
+## 更新
+
+单独更新本扩展：
+
+```bash
+pi update git:github.com/h1057399903-web/pi-plugin-swarm
+```
+
+或者更新所有已安装的 Pi 扩展包：
+
+```bash
+pi update --extensions
+```
+
+更新后重新启动 Pi，或运行 `/reload`。通过 Git 安装的扩展目前不会自动升级或弹出新版本通知；执行更新命令时会拉取本仓库 `main` 的最新内容。
+
 ## 要求与使用提醒
 
 - 需要 Node.js 22.19 或更新版本。当前版本已在 Pi 0.84.4 上测试。

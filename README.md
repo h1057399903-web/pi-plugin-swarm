@@ -12,6 +12,22 @@ pi install git:github.com/h1057399903-web/pi-plugin-swarm
 
 Then restart Pi or run `/reload`.
 
+## Update
+
+Update this package directly:
+
+```bash
+pi update git:github.com/h1057399903-web/pi-plugin-swarm
+```
+
+Or update all installed Pi packages:
+
+```bash
+pi update --extensions
+```
+
+Then restart Pi or run `/reload`. Git-installed packages do not currently update themselves or show automatic release notifications; running an update command pulls the latest `main` from this repository.
+
 ## Requirements and usage notes
 
 - Node.js 22.19 or newer is required. The current release is tested with Pi 0.84.4.
