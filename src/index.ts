@@ -68,9 +68,13 @@ function makeWorker(runId: string, task: SwarmTask, index: number, resumable: bo
 }
 
 export function registerSwarmExtension(pi: ExtensionAPI): void {
-  const root = globalThis as typeof globalThis & { [REGISTER_KEY]?: boolean };
+  const root = globalThis as typeof globalThis & { [REGISTER_KEY]?: object };
   if (root[REGISTER_KEY]) return;
-  root[REGISTER_KEY] = true;
+  const registrationToken = {};
+  root[REGISTER_KEY] = registrationToken;
+  pi.on("session_shutdown", (event) => {
+    if ((event.reason === "quit" || event.reason === "reload") && root[REGISTER_KEY] === registrationToken) delete root[REGISTER_KEY];
+  });
 
   const runtime = new SwarmAgentRuntime();
   const integration = getSwarmIntegration();
