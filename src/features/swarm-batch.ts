@@ -12,19 +12,26 @@ export type SwarmTaskStatus =
   | "completed"
   | "failed"
   | "aborted"
-  | "rate_limited";
+  | "rate_limited"
+  /** Waiting for its rate-limit retry deadline; this is a transient status. */
+  | "suspended";
 
 export interface SwarmBatchResult<T, R> {
   readonly index: number;
   readonly task: T;
-  readonly status: SwarmTaskStatus;
+  /** A completed batch result is always terminal; suspended is progress-only. */
+  readonly status: Exclude<SwarmTaskStatus, "suspended">;
   readonly attempts: number;
   readonly value?: R;
   readonly error?: unknown;
 }
 
+type SwarmProgressResult<T, R> = Omit<SwarmBatchResult<T, R>, "status"> & {
+  readonly status: SwarmTaskStatus;
+};
+
 export interface SwarmBatchProgress<T, R> {
-  readonly results: readonly SwarmBatchResult<T, R>[];
+  readonly results: readonly SwarmProgressResult<T, R>[];
   readonly active: number;
   readonly queued: number;
   readonly completed: number;
@@ -146,6 +153,11 @@ export class SwarmBatch<T, R> {
     if (this.aborting) { this.emit(); return; }
     this.recover();
     const now = this.clock.now();
+    // A retry is suspended until its exact backoff deadline. The wake timer
+    // brings it back into the runnable queue; never launch it early.
+    for (const state of this.states) {
+      if (!state.result && state.status === "suspended" && state.readyAt <= now) state.status = "queued";
+    }
     // scheduler state is intentionally synchronous up to launcher invocation
     while (this.active.size < this.capacity) {
       const state = this.states.find((item) => !item.result && item.status === "queued" && item.readyAt <= now);
@@ -237,7 +249,9 @@ export class SwarmBatch<T, R> {
       state.status = "rate_limited";
       state.result = { index: state.index, task: state.task, status: "rate_limited", attempts: state.attempts, error: "Rate limit retry budget exhausted." };
     } else {
-      state.status = "queued";
+      // Keep retrying work out of the runnable queue. It remains visible to
+      // progress observers while its wake timer is pending.
+      state.status = "suspended";
       state.readyAt = now + this.retryBaseMs * 2 ** (state.attempts - 1);
     }
     this.lastRateLimitAt = now;
@@ -256,7 +270,7 @@ export class SwarmBatch<T, R> {
 
   private armNextWakeup(): void {
     if (this.finished || this.wakeTimer !== undefined) return;
-    const queued = this.states.filter((s) => !s.result && s.status === "queued");
+    const queued = this.states.filter((s) => !s.result && (s.status === "queued" || s.status === "suspended"));
     if (!queued.length || this.active.size >= this.capacity) return;
     const now = this.clock.now();
     const readyAt = queued.reduce((at, s) => Math.min(at, s.readyAt), Number.POSITIVE_INFINITY);
@@ -307,8 +321,8 @@ export class SwarmBatch<T, R> {
 
   private emit(): void {
     if (!this.options.onProgress) return;
-    const results = this.states.map((s) => s.result ?? { index: s.index, task: s.task, status: s.status, attempts: s.attempts });
-    this.options.onProgress({ results, active: this.active.size, queued: this.states.filter((s) => !s.result && s.status === "queued").length, completed: this.states.filter((s) => s.result).length, capacity: this.capacity });
+    const results: SwarmProgressResult<T, R>[] = this.states.map((s) => s.result ?? { index: s.index, task: s.task, status: s.status, attempts: s.attempts });
+    this.options.onProgress({ results, active: this.active.size, queued: this.states.filter((s) => !s.result && (s.status === "queued" || s.status === "suspended")).length, completed: this.states.filter((s) => s.result).length, capacity: this.capacity });
   }
 }
 

@@ -6,6 +6,7 @@ import {
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import { createHash } from "node:crypto";
+import { realpath } from "node:fs/promises";
 import { join, relative, resolve } from "node:path";
 
 export const WORKER_MODEL = "openai-codex/gpt-5.6-luna";
@@ -14,15 +15,22 @@ export const MAX_OUTPUT_BYTES = 50 * 1024;
 export const DEFAULT_PROGRESS_THROTTLE_MS = 250;
 
 export type WorkerStatus = "queued" | "starting" | "running" | "completed" | "failed" | "aborted" | "rate_limited";
+export type WorkerProfile = "explore" | "coder";
+export const DEFAULT_WORKER_PROFILE: WorkerProfile = "coder";
+const WORKER_METADATA_TYPE = "pi-plugin-swarm.worker";
+const PROFILE_TOOLS: Record<WorkerProfile, string[]> = {
+  explore: ["read"],
+  coder: ["read", "bash", "edit", "write"],
+};
 export interface WorkerInput {
   workerId: string; prompt: string; cwd: string; item?: unknown; timeoutMs?: number;
-  agentId?: string; ownerSessionId?: string; persist?: boolean; resume?: boolean; forkSessionFile?: string;
+  profile?: WorkerProfile; subagentType?: WorkerProfile; subagent_type?: WorkerProfile; agentId?: string; ownerSessionId?: string; persist?: boolean; resume?: boolean; forkSessionFile?: string;
 }
-export interface WorkerProgress { workerId: string; status: WorkerStatus; turns: number; output?: string; }
+export interface WorkerProgress { workerId: string; status: WorkerStatus; turns: number; output?: string; profile?: WorkerProfile; item?: unknown; }
 export interface WorkerUsage { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number; }
 export interface WorkerResult {
   workerId: string; agentId: string; resumable: boolean; status: WorkerStatus; startedAt?: number; finishedAt: number; durationMs: number;
-  turns: number; usage: WorkerUsage; output: string; error?: string;
+  turns: number; usage: WorkerUsage; output: string; profile: WorkerProfile; item?: unknown; error?: string;
 }
 
 export interface RuntimeSeams {
@@ -35,6 +43,7 @@ export interface RuntimeSeams {
   sessionForkFactory?: (path: string, cwd: string, sessionDir: string, agentId?: string) => any;
   agentDirFactory?: () => string;
   resourceLoaderFactory?: (cwd: string) => any;
+  realpathFactory?: (path: string) => Promise<string>;
   now?: () => number;
   progressThrottleMs?: number;
 }
@@ -43,7 +52,7 @@ const SAFETY_POLICY = [
   "You are an in-process swarm worker. Work only on the supplied prompt and report the final answer.",
   "Never load extensions, skills, prompt templates, themes, or project context files.",
   "Never reveal credentials, environment secrets, tokens, or private request data.",
-  "Use read, bash, edit, and write only inside the delegated working directory. Never start subagents, deploy, restart services, mutate production, install devices, merge pull requests, or handle credentials.",
+  "Use only the tools granted by your enforced capability profile and stay inside the delegated working directory. Never start subagents, deploy, restart services, mutate production, install devices, merge pull requests, or handle credentials.",
 ].join("\n");
 
 function textOf(content: unknown): string {
@@ -74,12 +83,18 @@ function safeError(error: unknown): string {
   if (isRateLimit(error)) return "Provider rate limit.";
   if (error instanceof Error) {
     if (error.name === "AbortError") return "Aborted.";
-    if (["Worker model is unavailable.", "Worker session is unavailable.", "Worker session is busy.", "Worker timed out."].includes(error.message)) return error.message;
+    if (["Worker model is unavailable.", "Worker session is unavailable.", "Worker session is busy.", "Worker timed out.", "Worker profile mismatch."].includes(error.message)) return error.message;
   }
   return "Worker failed.";
 }
 
 const SESSION_UNAVAILABLE = "Worker session is unavailable.";
+const ACTIVE_AGENTS_KEY = Symbol.for("pi-plugin-swarm.active-agents.v1");
+type GlobalWithActiveAgents = typeof globalThis & { [ACTIVE_AGENTS_KEY]?: Set<string> };
+function activeAgents(): Set<string> {
+  const root = globalThis as GlobalWithActiveAgents;
+  return root[ACTIVE_AGENTS_KEY] ??= new Set<string>();
+}
 function ownerScope(ownerSessionId: string): string {
   return createHash("sha256").update(ownerSessionId || "anonymous", "utf8").digest("hex").slice(0, 32);
 }
@@ -100,7 +115,6 @@ function unavailable(): Error {
 export class SwarmAgentRuntime {
   private runtimePromise?: Promise<any>;
   private readonly workers = new Map<string, { controller: AbortController; session?: any; cleaned: boolean }>();
-  private readonly activeAgents = new Set<string>();
   private readonly seams: RuntimeSeams;
   constructor(seams: RuntimeSeams = {}) { this.seams = seams; }
 
@@ -111,7 +125,12 @@ export class SwarmAgentRuntime {
   async run(input: WorkerInput, onProgress?: (progress: WorkerProgress) => void): Promise<WorkerResult> {
     const started = this.seams.now?.() ?? Date.now();
     let agentId = input.agentId || input.workerId;
+    const requestedProfile = input.profile || input.subagentType || input.subagent_type;
+    let profile: WorkerProfile = requestedProfile === "explore" || requestedProfile === "coder" ? requestedProfile : DEFAULT_WORKER_PROFILE;
+    let item = input.item;
+    let metadataResolved = input.resume !== true;
     const resumable = input.persist === true;
+    let sessionAvailable = false;
     const agentKey = resumable && input.agentId ? `${ownerScope(input.ownerSessionId || "anonymous")}:${input.agentId}` : undefined;
     const state = { controller: new AbortController(), cleaned: false, session: undefined as any };
     this.workers.set(input.workerId, state);
@@ -119,12 +138,14 @@ export class SwarmAgentRuntime {
     let lastOutputProgressAt = -Infinity;
     const progressThrottleMs = Math.max(0, this.seams.progressThrottleMs ?? DEFAULT_PROGRESS_THROTTLE_MS);
     const usage: WorkerUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
-    const report = (status: WorkerStatus, chunk?: string) => { onProgress?.({ workerId: input.workerId, status, turns, output: chunk }); };
+    const report = (status: WorkerStatus, chunk?: string) => {
+      onProgress?.({ workerId: input.workerId, status, turns, output: chunk, ...(metadataResolved ? { profile, item } : {}) });
+    };
     const reportOutput = () => {
       const now = this.seams.now?.() ?? Date.now();
       if (now - lastOutputProgressAt < progressThrottleMs) return;
       lastOutputProgressAt = now;
-      onProgress?.({ workerId: input.workerId, status: "running", turns, output: cap(output) });
+      onProgress?.({ workerId: input.workerId, status: "running", turns, output: cap(output), ...(metadataResolved ? { profile, item } : {}) });
     };
     report("queued");
     report("starting");
@@ -136,11 +157,12 @@ export class SwarmAgentRuntime {
     let unsubscribe: (() => void) | undefined;
     try {
       if (agentKey) {
-        if (this.activeAgents.has(agentKey)) throw Object.assign(new Error("Worker session is busy."), { safeMessage: "Worker session is busy." });
-        this.activeAgents.add(agentKey);
+        if (activeAgents().has(agentKey)) throw Object.assign(new Error("Worker session is busy."), { safeMessage: "Worker session is busy." });
+        activeAgents().add(agentKey);
       }
       const aborted = new Promise<never>((_, reject) => state.controller.signal.addEventListener("abort", () => reject(state.controller.signal.reason || new Error("Aborted.")), { once: true }));
       const operation = (async () => {
+        if (requestedProfile && requestedProfile !== "explore" && requestedProfile !== "coder") throw Object.assign(new Error("Worker profile mismatch."), { safeMessage: "Worker profile mismatch." });
         const runtime = await this.runtime();
         state.controller.signal.throwIfAborted();
         const model = runtime?.getModel?.("openai-codex", "gpt-5.6-luna") ?? runtime?.getModel?.(WORKER_MODEL);
@@ -161,9 +183,19 @@ export class SwarmAgentRuntime {
             try {
               const sessions = await (this.seams.sessionListFactory || ((dir) => SessionManager.listAll(dir)))(ownerDir);
               state.controller.signal.throwIfAborted();
-              const match = sessions.find((session: any) => session?.id === input.agentId && typeof session.path === "string" && isInside(session.path, ownerDir));
+              const match = sessions.find((session: any) => session?.id === input.agentId && typeof session.path === "string");
               if (!match) throw unavailable();
-              sessionManager = this.seams.sessionOpenFactory?.(match.path, ownerDir, input.cwd) ?? SessionManager.open(match.path, ownerDir, input.cwd);
+              const canonicalize = this.seams.realpathFactory ?? realpath;
+              const [canonicalOwnerDir, canonicalSessionPath] = await Promise.all([canonicalize(ownerDir), canonicalize(match.path)]);
+              if (!isInside(canonicalSessionPath, canonicalOwnerDir)) throw unavailable();
+              sessionManager = this.seams.sessionOpenFactory?.(canonicalSessionPath, ownerDir, input.cwd) ?? SessionManager.open(canonicalSessionPath, ownerDir, input.cwd);
+              const entries = sessionManager.getEntries?.() || match.entries || [];
+              const metadata = [...entries].reverse().find((entry: any) => entry?.type === "custom" && entry.customType === WORKER_METADATA_TYPE)?.data;
+              const recoveredProfile: WorkerProfile = metadata?.profile === "explore" || metadata?.profile === "coder" ? metadata.profile : DEFAULT_WORKER_PROFILE;
+              if (requestedProfile && requestedProfile !== recoveredProfile) throw Object.assign(new Error("Worker profile mismatch."), { safeMessage: "Worker profile mismatch." });
+              profile = recoveredProfile;
+              if (metadata && Object.prototype.hasOwnProperty.call(metadata, "item")) item = metadata.item;
+              metadataResolved = true;
             } catch (error) {
               if (state.controller.signal.aborted) throw state.controller.signal.reason;
               if ((error as any)?.safeMessage) throw error;
@@ -175,11 +207,16 @@ export class SwarmAgentRuntime {
             sessionManager = this.seams.sessionCreateFactory?.(input.cwd, ownerDir, input.agentId) ?? SessionManager.create(input.cwd, ownerDir, { id: input.agentId });
           }
         }
+        sessionAvailable = resumable;
         state.controller.signal.throwIfAborted();
         if (resumable && !input.agentId) agentId = sessionManager.getSessionId?.() || agentId;
+        if (resumable && !input.resume) {
+          sessionManager.appendCustomEntry?.(WORKER_METADATA_TYPE, { profile, item: input.item });
+        }
+        const tools = PROFILE_TOOLS[profile];
         const created = await (this.seams.sessionFactory || createAgentSession)({
           cwd: input.cwd, modelRuntime: runtime, model, thinkingLevel: WORKER_THINKING_LEVEL,
-          sessionManager, resourceLoader: loader, tools: ["read", "bash", "edit", "write"],
+          sessionManager, resourceLoader: loader, tools,
         });
         state.session = created.session;
         if (state.controller.signal.aborted) {
@@ -201,18 +238,18 @@ export class SwarmAgentRuntime {
       if (!output) { const messages = state.session.messages || state.session.agent?.state?.messages || []; for (let i = messages.length - 1; i >= 0; i--) if (messages[i]?.role === "assistant") { output = textOf(messages[i].content); addUsage(usage, usageOf(messages[i])); break; } }
       report("completed");
       const finished = this.seams.now?.() ?? Date.now();
-      return { workerId: input.workerId, agentId, resumable, status: "completed", startedAt: started, finishedAt: finished, durationMs: finished - started, turns, usage, output: cap(output) };
+      return { workerId: input.workerId, agentId, resumable: resumable && sessionAvailable, status: "completed", startedAt: started, finishedAt: finished, durationMs: finished - started, turns, usage, output: cap(output), profile, item };
     } catch (error) {
       const aborted = !timedOut && (state.controller.signal.aborted || (error as any)?.name === "AbortError");
       const rate = isRateLimit(error);
       const resultStatus: WorkerStatus = rate ? "rate_limited" : aborted ? "aborted" : "failed";
       report(resultStatus);
       const finished = this.seams.now?.() ?? Date.now();
-      return { workerId: input.workerId, agentId, resumable, status: resultStatus, startedAt: started, finishedAt: finished, durationMs: finished - started, turns, usage, output: cap(output), error: timedOut ? "Worker timed out." : safeError(error) };
+      return { workerId: input.workerId, agentId, resumable: resumable && sessionAvailable, status: resultStatus, startedAt: started, finishedAt: finished, durationMs: finished - started, turns, usage, output: cap(output), profile, item, error: timedOut ? "Worker timed out." : safeError(error) };
     } finally {
       if (timer) clearTimeout(timer);
       unsubscribe?.();
-      if (agentKey) this.activeAgents.delete(agentKey);
+      if (agentKey) activeAgents().delete(agentKey);
       await this.cleanup(input.workerId);
     }
   }

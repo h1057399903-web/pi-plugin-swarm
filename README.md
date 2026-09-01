@@ -48,7 +48,15 @@ No npm publication or GitHub Release is required. Installing directly from this 
 /swarm <task>
 ```
 
-The model can call the `swarm` tool with 1–128 bounded work packages. Default concurrency is adaptive (`min(total workers, 16)`); callers may request a lower or explicit limit up to 16. Completed workers return stable `agentId` values and can be resumed with `resume_agent_ids`. New workers can set `fork: true` when every task genuinely requires the completed parent conversation.
+The model can call the `swarm` tool with 1–128 bounded work packages. Default concurrency is adaptive (`min(total workers, 16)`); callers may request a lower or explicit limit up to 16. Every worker is fixed to Luna (`openai-codex/gpt-5.6-luna`) with `medium` thinking. Profiles are enforced runtime capabilities: `explore` receives only `read`, while `coder` receives `read`, `bash`, `edit`, and `write`; `coder` is the backward-compatible default. Completed workers return a stable owner-scoped `agentId` and can be resumed with `resume_agent_ids`; a resumed worker keeps that identity and cannot be silently replaced by a new worker. New workers can set `fork: true` when every task genuinely requires the completed parent conversation. Resume and fork cannot be combined. Set `subagent_type: "explore"` for repository investigation and read-only analysis, or `subagent_type: "coder"` for implementation and verification. They use the same model but different enforced tool permissions; an `explore` session cannot be escalated to `coder` when resumed.
+
+## Task validation and lifecycle
+
+- New tasks are rendered from their task prompt (or `prompt_template`/`promptTemplate` and `{{item}}`) before launch. Duplicate rendered prompts are rejected before any session is created; resume entries are intentionally excluded from this check.
+- `resume_agent_ids` maps an existing `agentId` to its follow-up prompt and launches those workers first. Resume requires a persisted parent session; `--no-session` workers are ephemeral and cannot resume or fork.
+- A rate-limited retry is reported as transient `suspended` telemetry while it waits for exponential backoff. If its retry budget is exhausted, the terminal status is `rate_limited`; progress includes attempts and reduced/recovered active capacity. Public integration snapshots/events expose only bounded status, identity, timing, model/profile metadata, and usage—not transcripts, paths, or credential values.
+- Workers must not spawn or delegate to other workers. This extension has no nested swarm execution.
+- The coordinator receives a resume hint for unfinished resumable workers, in the form `resume_agent_ids: {"<agentId>": "..."}`.
 
 ## Runtime model
 
@@ -71,12 +79,12 @@ Unlike v0.1, workers do not start complete Pi CLI child processes. They use the 
 - in-memory workers for `--no-session` parents;
 - dispose-after-run and reload-on-resume to keep memory bounded;
 - no extension recursion;
-- `read`, `bash`, `edit`, and `write` coding tools;
+- profile-bound tools: `explore` gets only `read`; `coder` gets `read`, `bash`, `edit`, and `write`;
 - bounded public output and usage accounting.
 
 ## Live acceptance
 
-The v0.3 acceptance run used 16 real Luna workers. All 16 executed a tool and completed with exact outputs; measured peak concurrency was 16, wall time was 23.93 seconds, and the isolated test process peaked at about 196 MiB RSS. A separate 16-worker abort run returned only after all 16 sessions were disposed (8.51 seconds, about 205 MiB peak RSS). Cross-process tool resume and parent-context fork were also verified with exact model replies.
+The v0.4 acceptance run used 16 real Luna workers. All 16 executed a tool and completed with exact outputs; measured peak concurrency was 16 and wall time was 23.56 seconds. A separate 16-worker abort run returned only after all 16 workers cleaned up (8.59 seconds). Persisted resume also retained the same agent ID and recalled the exact prior-turn value.
 
 These are optional networked acceptance tests rather than part of the offline unit suite.
 

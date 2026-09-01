@@ -1,6 +1,6 @@
 {
   "name": "pi-plugin-swarm",
-  "version": "0.3.5",
+  "version": "0.4.0",
   "description": "Kimi-style in-process Luna worker swarm for the Pi coding agent",
   "license": "MIT",
   "keywords": ["pi", "pi-package", "pi-extension", "swarm", "subagent", "multi-agent"],
@@ -24,6 +24,7 @@
     "check": "npm run typecheck && npm run test:unit && npm run smoke && npm run smoke:packed"
   },
   "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*",
     "typebox": "*"

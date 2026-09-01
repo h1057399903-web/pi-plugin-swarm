@@ -88,6 +88,35 @@ const flush = () => new Promise((resolve) => queueMicrotask(resolve));
   assert.equal(attempts.find((x) => x[0] === "a" && x[1] === 2)[2], 3000);
 }
 
+// Rate-limited retries are observable as suspended and wake exactly at readyAt.
+{
+  const clock = new FakeClock();
+  const attempts = [];
+  const snapshots = []; const queuedCounts = [];
+  const resultPromise = new SwarmBatch(["retry"], (_task, context) => {
+    attempts.push([context.attempt, clock.now()]);
+    if (context.attempt === 1) throw new Error("429");
+    return "ok";
+  }, {
+    maxConcurrency: 1,
+    initialLaunchLimit: 1,
+    launchStaggerMs: 0,
+    retryBaseMs: 100,
+    clock,
+    onProgress: (progress) => { snapshots.push(progress.results[0].status); queuedCounts.push([progress.results[0].status, progress.queued]); },
+    isRateLimitedError: (error) => error.message === "429",
+  }).run();
+  await flush();
+  assert.deepEqual(attempts, [[1, 0]]);
+  assert.ok(snapshots.includes("suspended"));
+  assert.ok(queuedCounts.some(([status, queued]) => status === "suspended" && queued === 1));
+  await clock.tick(99);
+  assert.deepEqual(attempts, [[1, 0]]);
+  await clock.tick(1);
+  assert.deepEqual(attempts, [[1, 0], [2, 100]]);
+  assert.equal((await resultPromise)[0].status, "completed");
+}
+
 // Abort marks queued work immediately but waits for active launcher cleanup.
 {
   const clock = new FakeClock();

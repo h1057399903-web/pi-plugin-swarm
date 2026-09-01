@@ -1,4 +1,7 @@
-export type PublicWorkerStatus = "queued" | "starting" | "running" | "completed" | "failed" | "aborted" | "rate_limited";
+export type PublicWorkerStatus = "queued" | "starting" | "running" | "completed" | "failed" | "aborted" | "rate_limited" | "suspended";
+
+/** Non-sensitive worker profile exposed by the public API. */
+export type PublicSwarmProfile = "explore" | "coder";
 
 export interface PublicSwarmWorker {
   workerId: string;
@@ -20,6 +23,8 @@ export interface PublicSwarmWorker {
   cost: number;
   model: string;
   thinking: string;
+  /** Optional safe worker profile (never a cwd or session identifier). */
+  profile?: PublicSwarmProfile;
   output?: string;
   error?: string;
 }
@@ -39,6 +44,8 @@ export interface PublicSwarmSnapshot {
   enabled: boolean;
   model: string;
   thinking: string;
+  /** Safe default worker profile; paths and session identity are absent. */
+  profile: PublicSwarmProfile;
   runs: PublicSwarmRun[];
 }
 
@@ -63,11 +70,47 @@ const MAX_RETAINED_RUNS = 20;
 
 type GlobalWithSwarm = typeof globalThis & { [KEY]?: SwarmIntegration };
 
-function cloneWorker(worker: PublicSwarmWorker): PublicSwarmWorker {
-  const { output: _output, error: _error, ...safe } = worker;
-  return safe;
+function cloneProfile(profile: PublicSwarmProfile | undefined): PublicSwarmProfile | undefined {
+  return profile === "explore" || profile === "coder" ? profile : undefined;
 }
-function cloneRun(run: PublicSwarmRun): PublicSwarmRun { return { ...run, workers: run.workers.map(cloneWorker) }; }
+
+function cloneWorker(worker: PublicSwarmWorker): PublicSwarmWorker {
+  // Copy the allow-listed public shape. In particular, do not spread runtime
+  // objects: callers may attach cwd/session paths to the internal value.
+  return {
+    workerId: worker.workerId,
+    agentId: worker.agentId,
+    resumed: worker.resumed,
+    resumable: worker.resumable,
+    index: worker.index,
+    item: worker.item,
+    status: worker.status,
+    attempt: worker.attempt,
+    ...(worker.startedAt === undefined ? {} : { startedAt: worker.startedAt }),
+    ...(worker.finishedAt === undefined ? {} : { finishedAt: worker.finishedAt }),
+    ...(worker.durationMs === undefined ? {} : { durationMs: worker.durationMs }),
+    turns: worker.turns,
+    inputTokens: worker.inputTokens,
+    outputTokens: worker.outputTokens,
+    cacheReadTokens: worker.cacheReadTokens,
+    cost: worker.cost,
+    model: worker.model,
+    thinking: worker.thinking,
+    ...(cloneProfile(worker.profile) === undefined ? {} : { profile: cloneProfile(worker.profile) }),
+  };
+}
+function cloneRun(run: PublicSwarmRun): PublicSwarmRun {
+  return {
+    runId: run.runId,
+    description: run.description,
+    status: run.status,
+    createdAt: run.createdAt,
+    ...(run.finishedAt === undefined ? {} : { finishedAt: run.finishedAt }),
+    requestedConcurrency: run.requestedConcurrency,
+    activeCapacity: run.activeCapacity,
+    workers: run.workers.map(cloneWorker),
+  };
+}
 
 class Integration implements SwarmIntegration {
   private enabled = false;
@@ -80,6 +123,7 @@ class Integration implements SwarmIntegration {
       enabled: this.enabled,
       model: "openai-codex/gpt-5.6-luna",
       thinking: "medium",
+      profile: "coder",
       runs: [...this.runs.values()].map(cloneRun),
     };
   }
@@ -91,7 +135,7 @@ class Integration implements SwarmIntegration {
 
   private emit(event: PublicSwarmEvent): void {
     for (const listener of [...this.listeners]) {
-      try { listener(event); } catch { /* Optional observers cannot break the swarm runtime. */ }
+      try { listener(structuredClone(event)); } catch { /* Optional observers cannot break or mutate the swarm runtime. */ }
     }
   }
 
@@ -104,7 +148,11 @@ class Integration implements SwarmIntegration {
   updateRun(run: PublicSwarmRun): void {
     this.runs.delete(run.runId);
     this.runs.set(run.runId, cloneRun(run));
-    while (this.runs.size > MAX_RETAINED_RUNS) this.runs.delete(this.runs.keys().next().value!);
+    while (this.runs.size > MAX_RETAINED_RUNS) {
+      const evicted = this.runs.keys().next().value!;
+      this.runs.delete(evicted);
+      this.controllers.delete(evicted);
+    }
     const event: PublicSwarmEvent = { type: "run", run: cloneRun(run), snapshot: this.snapshot() };
     this.emit(event);
   }
@@ -117,7 +165,9 @@ class Integration implements SwarmIntegration {
   }
 
   clearRuns(): void {
-    for (const cancel of this.controllers.values()) cancel();
+    for (const cancel of this.controllers.values()) {
+      try { cancel(); } catch { /* A controller is optional and must not break cleanup. */ }
+    }
     this.controllers.clear();
     for (const runId of [...this.runs.keys()]) this.removeRun(runId);
   }
@@ -129,7 +179,7 @@ class Integration implements SwarmIntegration {
   cancelRun(runId: string): boolean {
     const cancel = this.controllers.get(runId);
     if (!cancel) return false;
-    cancel();
+    try { cancel(); } catch { /* Optional controllers cannot break the public API. */ }
     return true;
   }
 }

@@ -48,7 +48,15 @@ pi update --extensions
 /swarm <任务>
 ```
 
-主模型可以调用 `swarm` 工具，提交 1–128 个边界清楚的工作包。默认并发会自适应为 `min(worker 总数, 16)`；调用方也可以指定不超过 16 的更低或明确并发值。已完成的 worker 会返回稳定的 `agentId`，可以通过 `resume_agent_ids` 继续工作。只有当每个新 worker 都确实需要完整父会话上下文时，才应设置 `fork: true`。
+主模型可以调用 `swarm` 工具，提交 1–128 个边界清楚的工作包。默认并发会自适应为 `min(worker 总数, 16)`；调用方也可以指定不超过 16 的更低或明确并发值。每个 worker 固定使用 Luna（`openai-codex/gpt-5.6-luna`）和 `medium` thinking。Profile 是运行时强制权限：`explore` 只有 `read`，`coder` 才有 `read`、`bash`、`edit` 和 `write`；为保持兼容，默认是 `coder`。完成的 worker 会返回稳定且按 owner 隔离的 `agentId`，可通过 `resume_agent_ids` 继续；恢复会保留该身份，不会静默替换成新 worker。只有当每个新 worker 都确实需要完整父会话上下文时，才应设置 `fork: true`；resume 与 fork 不能同时使用。仓库调查和只读分析可设置 `subagent_type: "explore"`；实现和验证可设置 `subagent_type: "coder"`。它们使用相同模型，但工具权限由运行时硬性区分；已有 `explore` Session 恢复时不能升级成 `coder`。
+
+## 任务校验与生命周期
+
+- 新任务会先根据任务 prompt（或 `prompt_template`/`promptTemplate` 与 `{{item}}`）渲染，再启动 worker。渲染后的新任务 prompt 重复时，会在创建 Session 前拒绝；恢复项有意不参与此检查。
+- `resume_agent_ids` 将已有 `agentId` 映射到后续 prompt，并优先启动这些 worker。恢复要求父 Session 已持久化；`--no-session` 的 worker 位于内存中，不能 resume 或 fork。
+- 遇到 rate limit 的重试在等待指数退避时会以临时 `suspended` telemetry 呈现；重试预算耗尽后终态为 `rate_limited`。进度会包含尝试次数以及活动容量的收缩/恢复。公共 integration snapshot/event 只暴露受限的状态、身份、时间、模型/profile 元数据和 usage，不暴露 transcript、路径或凭证值。
+- Worker 不得启动或委派其他 worker；本扩展不支持嵌套 swarm。
+- 对仍可恢复但未完成的 worker，协调器会收到 `resume_agent_ids: {"<agentId>": "..."}` 形式的 resume hint。
 
 ## 运行时模型
 
@@ -71,12 +79,12 @@ pi update --extensions
 - `--no-session` 父会话使用内存 worker；
 - 每轮完成后 dispose，恢复时重新加载，以控制内存；
 - 不递归加载扩展；
-- 只提供 `read`、`bash`、`edit` 和 `write` 编码工具；
+- Profile 绑定工具：`explore` 只有 `read`；`coder` 有 `read`、`bash`、`edit` 和 `write`；
 - 公共输出和 usage accounting 均有边界限制。
 
 ## 真实验收
 
-v0.3 使用 16 个真实 Luna worker 完成验收。16 个 worker 全部实际调用工具并返回精确结果；峰值并发为 16，墙钟时间 23.93 秒，隔离测试进程峰值 RSS 约 196 MiB。另一轮 16-worker abort 测试只在全部 16 个 Session 都完成 dispose 后返回，耗时 8.51 秒，峰值 RSS 约 205 MiB。跨进程工具 resume 和父上下文 fork 也通过了精确模型回复验证。
+v0.4 使用 16 个真实 Luna worker 完成验收。16 个 worker 全部实际调用工具并返回精确结果；峰值并发为 16，墙钟时间 23.56 秒。另一轮 16-worker abort 测试只在全部 16 个 worker 清理完成后返回，耗时 8.59 秒。持久化 resume 也保留了同一 Agent ID，并准确回忆上一轮的值。
 
 这些是可选的联网验收测试，不属于离线单元测试套件。
 

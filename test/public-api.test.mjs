@@ -6,6 +6,12 @@ for (const run of integration.snapshot().runs) integration.removeRun(run.runId);
 const badListener = integration.subscribe(() => { throw new Error("observer failure"); });
 assert.doesNotThrow(() => integration.setEnabled(false), "optional observers must not break producers");
 badListener();
+let isolatedEnabled;
+const mutatingListener = integration.subscribe((event) => { event.snapshot.enabled = false; });
+const isolatedListener = integration.subscribe((event) => { isolatedEnabled = event.snapshot.enabled; });
+integration.setEnabled(true);
+assert.equal(isolatedEnabled, true, "each observer must receive an isolated event clone");
+mutatingListener(); isolatedListener();
 const events = [];
 const unsubscribe = integration.subscribe((event) => events.push(event));
 integration.setEnabled(true);
@@ -17,9 +23,10 @@ integration.updateRun({
   requestedConcurrency: 2,
   activeCapacity: 2,
   workers: [{
-    workerId: "worker-1", agentId: "agent-1", resumed: false, resumable: true, index: 0, item: "one", status: "running", attempt: 1,
+    workerId: "worker-1", agentId: "agent-1", resumed: false, resumable: true, index: 0, item: "one", status: "suspended", attempt: 1,
     turns: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cost: 0,
-    model: "openai-codex/gpt-5.6-luna", thinking: "medium", output: "private transcript", error: "private error",
+    model: "openai-codex/gpt-5.6-luna", thinking: "medium", profile: "coder", output: "private transcript", error: "private error",
+    cwd: "C:/private/project", sessionPath: "C:/private/session.json",
   }],
 });
 const snapshot = integration.snapshot();
@@ -28,8 +35,13 @@ assert.equal(snapshot.runs.length, 1);
 assert.equal(snapshot.runs[0].workers[0].workerId, "worker-1");
 assert.equal(snapshot.runs[0].workers[0].output, undefined);
 assert.equal(snapshot.runs[0].workers[0].error, undefined);
+assert.equal(snapshot.runs[0].workers[0].status, "suspended");
+assert.equal(snapshot.runs[0].workers[0].cwd, undefined);
+assert.equal(snapshot.runs[0].workers[0].sessionPath, undefined);
+assert.equal(snapshot.profile, "coder");
+assert.equal(snapshot.runs[0].workers[0].profile, "coder");
 snapshot.runs[0].workers[0].status = "failed";
-assert.equal(integration.snapshot().runs[0].workers[0].status, "running", "snapshots must be defensive clones");
+assert.equal(integration.snapshot().runs[0].workers[0].status, "suspended", "snapshots must be defensive clones");
 let cancelled = 0;
 integration.setRunController("run-1", () => cancelled++);
 assert.equal(integration.cancelRun("run-1"), true);

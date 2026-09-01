@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { Text } from "@earendil-works/pi-tui";
 import { SwarmBatch, type SwarmTaskStatus } from "./features/swarm-batch.ts";
-import { SwarmAgentRuntime, WORKER_MODEL, WORKER_THINKING_LEVEL, type WorkerResult } from "./swarm-agent-runtime.ts";
+import { SwarmAgentRuntime, WORKER_MODEL, WORKER_THINKING_LEVEL, type WorkerProfile, type WorkerResult } from "./swarm-agent-runtime.ts";
 import { getSwarmIntegration, type PublicSwarmRun, type PublicSwarmWorker } from "./public-api.ts";
 
 const MAX_TASKS = 128;
@@ -13,13 +14,44 @@ const LAUNCH_STAGGER_MS = 700;
 const STATE_TYPE = "pi-swarm-state";
 const RUN_STATE_TYPE = "pi-swarm-run-v1";
 
-interface SwarmTask { item: string; prompt?: string; cwd?: string; timeoutMs?: number; agentId?: string; resume?: boolean; }
+export type SwarmSubagentType = WorkerProfile;
+interface SwarmTask { item: string; prompt?: string; cwd?: string; timeoutMs?: number; agentId?: string; resume?: boolean; subagent_type?: SwarmSubagentType; }
+
+/** Guidance deliberately lives in the coordinator, rather than in user task text. */
+export const COORDINATOR_GUIDANCE = "Act as the swarm coordinator: split only genuinely independent, bounded work; assign non-overlapping ownership; inspect every result and verification signal; integrate the work yourself. Do not ask workers to spawn workers or delegate further.";
+const WORKER_GUIDANCE = "Complete only the supplied bounded work package and report the result to the coordinator. Do not coordinate other packages, spawn workers, or delegate further.";
+
+export function renderSwarmTaskPrompt(task: Pick<SwarmTask, "item" | "prompt" | "subagent_type">, promptTemplate?: string, prompt_template?: string): string {
+  const template = task.prompt ?? promptTemplate ?? prompt_template ?? "Complete this bounded work package: {{item}}";
+  return template.replaceAll("{{item}}", task.item);
+}
+
+/** Reject accidental duplicate work before any session is created. Resumes are excluded by the caller. */
+export function validateUniqueRenderedPrompts(tasks: readonly SwarmTask[], promptTemplate?: string, prompt_template?: string): string[] {
+  const seen = new Map<string, number>();
+  const rendered = tasks.map((task, index) => {
+    const prompt = renderSwarmTaskPrompt(task, promptTemplate, prompt_template);
+    const previous = seen.get(prompt);
+    if (previous !== undefined) throw new Error(`Duplicate rendered prompt for new tasks ${previous + 1} and ${index + 1}`);
+    seen.set(prompt, index);
+    return prompt;
+  });
+  return rendered;
+}
+
+export function resumeAgentIdsHint(workers: readonly Pick<PublicSwarmWorker, "agentId" | "item" | "status" | "resumable">[]): string {
+  const unfinished = workers.filter((worker) => worker.resumable && worker.status !== "completed");
+  if (!unfinished.length) return "";
+  const ids = Object.fromEntries(unfinished.map((worker) => [worker.agentId, `Continue the unfinished work package: ${worker.item}`]));
+  return `resume_agent_ids: ${JSON.stringify(ids)}`;
+}
 
 const WorkerTask = Type.Object({
   item: Type.String({ description: "Short item name or bounded work package" }),
   prompt: Type.Optional(Type.String({ description: "Task-specific prompt; overrides promptTemplate" })),
   cwd: Type.Optional(Type.String({ description: "Worker directory; defaults to the parent working directory" })),
   timeoutMs: Type.Optional(Type.Integer({ minimum: 1_000, maximum: 3_600_000, description: "Optional worker timeout" })),
+  subagent_type: Type.Optional(StringEnum(["explore", "coder"] as const, { description: "Enforced capability profile: explore is read-only; coder can read, run commands, edit, and write. Defaults to coder." })),
 });
 
 const ResumeAgentMap = Type.Record(Type.String({ minLength: 1 }), Type.String({ minLength: 1 }), { maxProperties: MAX_TASKS, description: "Map of prior agent ID to its follow-up prompt; resumed workers launch first" });
@@ -96,7 +128,7 @@ export function registerSwarmExtension(pi: ExtensionAPI): void {
 
   pi.on("before_agent_start", (event) => {
     if (!enabled) return;
-    return { systemPrompt: `${event.systemPrompt}\n\nSWARM MODE IS ACTIVE. Use the swarm tool when work can be split into useful bounded packages. Run as many packages concurrently as are genuinely independent; use one worker only for a single or serial package. Workers use Luna medium. Inspect their changes and tests yourself. Never delegate credentials, production mutation, deployments, service restarts, device installation, merges, or overlapping edits.` };
+    return { systemPrompt: `${event.systemPrompt}\n\nSWARM MODE IS ACTIVE. ${COORDINATOR_GUIDANCE} Workers use Luna medium. Never delegate credentials, production mutation, deployments, service restarts, device installation, merges, or overlapping edits.` };
   });
 
   pi.registerCommand("swarm", {
@@ -129,6 +161,7 @@ export function registerSwarmExtension(pi: ExtensionAPI): void {
     promptSnippet: "Delegate bounded independent packages to in-process Luna workers",
     promptGuidelines: [
       "Use as many workers as are useful for independent packages with non-overlapping file ownership; use one only for a single or serial package.",
+      "Use subagent_type explore for read-only investigation and coder only when the worker must run commands or modify files.",
       "Never delegate credentials, production mutations, deployments, service restarts, device installation, or merges.",
       "Inspect worker changes and verification evidence before accepting them.",
       "Use resume_agent_ids for follow-up work by a prior worker; use fork only when every new worker requires the parent conversation context.",
@@ -137,6 +170,9 @@ export function registerSwarmExtension(pi: ExtensionAPI): void {
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       const shorthandTasks: SwarmTask[] = (params.items ?? []).map((item) => ({ item }));
       const newTasks = [...((params.tasks ?? []) as SwarmTask[]), ...shorthandTasks];
+      // Only newly-created workers participate: a resume prompt is intentionally allowed
+      // to resemble an earlier task while repairing that worker.
+      validateUniqueRenderedPrompts(newTasks, params.promptTemplate, params.prompt_template);
       const resumeMap = { ...(params.resume_agent_ids ?? {}), ...(params.resumeAgentIds ?? {}) };
       const resumedTasks: SwarmTask[] = Object.entries(resumeMap).map(([agentId, prompt]) => ({ item: `Resume ${agentId}`, prompt, agentId, resume: true }));
       if (params.fork && resumedTasks.length) throw new Error("fork cannot be combined with resumeAgentIds");
@@ -151,7 +187,11 @@ export function registerSwarmExtension(pi: ExtensionAPI): void {
       if (resumedTasks.length && !resumable) throw new Error("Resume requires a persisted parent session");
       const requestedConcurrency = resolveSwarmConcurrency(tasks.length, params.concurrency);
       const runId = randomUUID();
-      const workers = tasks.map((task, index) => makeWorker(runId, task, index, resumable));
+      const workers = tasks.map((task, index) => {
+        const worker = makeWorker(runId, task, index, resumable);
+        if (!task.resume) worker.profile = task.subagent_type ?? "coder";
+        return worker;
+      });
       const run: PublicSwarmRun = { runId, description: params.description.slice(0, 500), status: "running", createdAt: Date.now(), requestedConcurrency, activeCapacity: requestedConcurrency, workers };
 
       let publishTimer: ReturnType<typeof setTimeout> | undefined;
@@ -176,8 +216,10 @@ export function registerSwarmExtension(pi: ExtensionAPI): void {
       const batch = new SwarmBatch(tasks, async (task, context) => {
         const worker = workers[context.index];
         worker.attempt = context.attempt;
-        const template = task.prompt ?? params.promptTemplate ?? params.prompt_template ?? "Complete this bounded work package: {{item}}";
-        const prompt = template.replaceAll("{{item}}", task.item);
+        const role = task.resume
+          ? "Resume under the capability profile persisted with this worker."
+          : `You are a ${task.subagent_type ?? "coder"} worker with an enforced runtime capability profile.`;
+        const prompt = `${WORKER_GUIDANCE}\n${role}\n\n${renderSwarmTaskPrompt(task, params.promptTemplate, params.prompt_template)}`;
         const stop = () => runtime.abort(worker.workerId);
         context.signal.addEventListener("abort", stop, { once: true });
         try {
@@ -192,9 +234,12 @@ export function registerSwarmExtension(pi: ExtensionAPI): void {
             cwd: task.cwd ?? ctx.cwd,
             item: task.item,
             timeoutMs: task.timeoutMs,
+            profile: task.resume ? undefined : task.subagent_type ?? "coder",
           }, (progress) => {
             worker.status = progress.status;
             worker.turns = progress.turns;
+            if (typeof progress.item === "string" && progress.item) worker.item = progress.item.slice(0, 200);
+            if (progress.profile !== undefined) worker.profile = publicProfile(progress.profile);
             if (progress.output) worker.output = progress.output;
             if (progress.status === "running" && worker.startedAt === undefined) worker.startedAt = Date.now();
             publish();
@@ -247,7 +292,8 @@ export function registerSwarmExtension(pi: ExtensionAPI): void {
       });
       const completed = workers.filter((worker) => worker.status === "completed").length;
       const summaries = workers.map((worker) => `### Worker ${worker.index + 1}: ${worker.item} — ${worker.status}\nAgent ID: ${worker.agentId}${worker.resumable ? " (resumable)" : ""}\n${worker.output || worker.error || "(no output)"}`);
-      return { content: [{ type: "text", text: `Swarm completed: ${completed}/${workers.length} succeeded\n\n${summaries.join("\n\n---\n\n")}` }], details: structuredClone(run) };
+      const resumeHint = resumeAgentIdsHint(workers);
+      return { content: [{ type: "text", text: `Swarm completed: ${completed}/${workers.length} succeeded\n\n${summaries.join("\n\n---\n\n")}${resumeHint ? `\n\nUnfinished resumable workers can be continued with:\n${resumeHint}` : ""}` }], details: structuredClone(run) };
     },
     renderCall(args, theme) {
       const count = countSwarmWorkers(args);
@@ -260,11 +306,14 @@ export function registerSwarmExtension(pi: ExtensionAPI): void {
       const failed = run.workers.some((worker) => worker.status === "failed" || worker.status === "rate_limited");
       let text = `${isPartial ? "⏳" : failed ? "◐" : "✓"} ${done}/${run.workers.length} workers`;
       for (const worker of run.workers) {
-        const icon = worker.status === "completed" ? "✓" : worker.status === "failed" || worker.status === "rate_limited" ? "✗" : worker.status === "aborted" ? "■" : "⏳";
-        text += `\n  ${icon} ${worker.item}`;
+        const status = worker.status as string;
+        const icon = status === "completed" ? "✓" : status === "failed" || status === "rate_limited" ? "✗" : status === "aborted" ? "■" : status === "suspended" ? "Ⅱ" : "⏳";
+        text += `\n  ${icon} ${worker.item}${status === "suspended" ? " (suspended)" : ""}`;
         if (worker.turns) text += theme.fg("dim", ` · ${worker.turns} turns · ↓${worker.outputTokens}`);
       }
       text += theme.fg("dim", `\n${WORKER_MODEL} · ${WORKER_THINKING_LEVEL} · capacity ${run.activeCapacity}/${run.requestedConcurrency}`);
+      const hint = resumeAgentIdsHint(run.workers);
+      if (hint) text += theme.fg("dim", `\n${hint}`);
       return new Text(text, 0, 0);
     },
   });
@@ -284,6 +333,13 @@ function applyWorkerResult(worker: PublicSwarmWorker, result: WorkerResult): voi
   worker.cost = result.usage.cost;
   worker.output = result.output;
   worker.error = result.error;
+  const recovered = result as WorkerResult & { item?: unknown; profile?: unknown };
+  if (typeof recovered.item === "string" && recovered.item) worker.item = recovered.item.slice(0, 200);
+  if (recovered.profile !== undefined) worker.profile = publicProfile(recovered.profile);
+}
+
+function publicProfile(profile: unknown): PublicSwarmWorker["profile"] {
+  return profile === "explore" ? "explore" : "coder";
 }
 
 export default registerSwarmExtension;
