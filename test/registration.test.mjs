@@ -30,6 +30,22 @@ const first = fakePi();
 registerSwarmExtension(first);
 assert.deepEqual(first.commands, ["swarm"]);
 assert.deepEqual(first.tools, ["swarm"]);
+assert.deepEqual(
+  first.commandDefs[0].getArgumentCompletions(""),
+  [
+    { value: "on", label: "on", description: "Enable Swarm mode" },
+    { value: "off", label: "off", description: "Disable Swarm mode" },
+    { value: "status", label: "status", description: "Show Swarm status" },
+    { value: "cancel ", label: "cancel <run-id>", description: "Cancel an active Swarm run" },
+  ],
+);
+assert.deepEqual(first.commandDefs[0].getArgumentCompletions("st"), [
+  { value: "status", label: "status", description: "Show Swarm status" },
+]);
+assert.deepEqual(first.commandDefs[0].getArgumentCompletions("ST"), [
+  { value: "status", label: "status", description: "Show Swarm status" },
+]);
+assert.equal(first.commandDefs[0].getArgumentCompletions("unknown"), null);
 const disabled = await first.toolDefs[0].execute("disabled", { description: "must not start", items: ["x"] }, undefined, undefined, {});
 assert.equal(disabled.isError, true);
 assert.match(disabled.content[0].text, /disabled/);

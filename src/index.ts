@@ -139,6 +139,16 @@ export function registerSwarmExtension(pi: ExtensionAPI): void {
 
   pi.registerCommand("swarm", {
     description: "Toggle/start/cancel Pi Swarm: /swarm on|off|status|cancel <run-id>|<task>",
+    getArgumentCompletions: (prefix) => {
+      const commands = [
+        { value: "on", label: "on", description: "Enable Swarm mode" },
+        { value: "off", label: "off", description: "Disable Swarm mode" },
+        { value: "status", label: "status", description: "Show Swarm status" },
+        { value: "cancel ", label: "cancel <run-id>", description: "Cancel an active Swarm run" },
+      ];
+      const matches = commands.filter((command) => command.value.startsWith(prefix.toLowerCase()));
+      return matches.length ? matches : null;
+    },
     handler: async (raw, ctx) => {
       const args = raw.trim(); const lower = args.toLowerCase();
       if (!args || lower === "on" || lower === "off") {
