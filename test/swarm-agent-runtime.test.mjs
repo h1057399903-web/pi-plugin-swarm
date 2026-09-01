@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
-import { SwarmAgentRuntime, MAX_OUTPUT_BYTES } from "../src/swarm-agent-runtime.ts";
+import { SwarmAgentRuntime, MAX_OUTPUT_BYTES, isPathInside } from "../src/swarm-agent-runtime.ts";
+
+// Containment is deterministic for both path syntaxes and does not use lexical prefixes.
+assert.equal(isPathInside("/repo/work", "/repo"), true);
+assert.equal(isPathInside("/repo-other", "/repo"), false);
+assert.equal(isPathInside("C:\\repo\\work", "C:\\repo"), true);
+assert.equal(isPathInside("C:\\repo-other", "C:\\repo"), false);
 
 const model = {};
 const ownerDirectory = (owner) => join("/test-agent", "swarm", "sessions", createHash("sha256").update(owner).digest("hex").slice(0, 32));
@@ -27,6 +33,25 @@ function sessionFor(text, delay = 0) {
   };
 }
 
+// The parent cwd gate runs before runtime/session factories.
+{
+  let factories = 0;
+  const result = await new SwarmAgentRuntime({
+    runtimeFactory: async () => { factories++; return { getModel: () => model }; },
+    realpathFactory: async (path) => path,
+  }).run({ workerId: "outside", prompt: "x", cwd: "/repo-other", parentCwd: "/repo" });
+  assert.equal(result.error, "Worker cwd is outside the parent working directory.");
+  assert.equal(factories, 0);
+
+  const relative = await new SwarmAgentRuntime(seams(() => sessionFor("relative"))).run({ workerId: "relative", prompt: "x", cwd: "child", parentCwd: "/repo" });
+  assert.equal(relative.status, "completed");
+  const symlink = await new SwarmAgentRuntime({
+    runtimeFactory: async () => { factories++; return { getModel: () => model }; },
+    realpathFactory: async (path) => path === "/repo/link" ? "/outside" : path,
+  }).run({ workerId: "symlink", prompt: "x", cwd: "/repo/link", parentCwd: "/repo" });
+  assert.equal(symlink.error, "Worker cwd is outside the parent working directory.");
+}
+
 // success, output, accounting, and cleanup
 {
   let s;
@@ -34,6 +59,18 @@ function sessionFor(text, delay = 0) {
   const result = await r.run({ workerId: "one", prompt: "hello", cwd: "/tmp" });
   assert.equal(result.status, "completed"); assert.equal(result.output, "ok"); assert.equal(result.turns, 1);
   assert.equal(result.usage.input, 2); assert.equal(s.disposed, true);
+}
+
+// run completion waits for asynchronous session disposal.
+{
+  let releaseDispose;
+  const disposeDone = new Promise((resolve) => { releaseDispose = resolve; });
+  const s = sessionFor("disposed");
+  s.dispose = () => disposeDone;
+  const pending = new SwarmAgentRuntime(seams(() => s)).run({ workerId: "async-dispose", prompt: "x", cwd: "/tmp" });
+  assert.equal(await Promise.race([pending.then(() => "resolved"), new Promise((resolve) => setTimeout(() => resolve("waiting"), 10))]), "waiting");
+  releaseDispose();
+  assert.equal((await pending).status, "completed");
 }
 
 // concurrent workers share one runtime but get separate in-memory managers/sessions

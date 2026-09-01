@@ -30,11 +30,11 @@ Then restart Pi or run `/reload`. Git-installed packages do not currently update
 
 ## Requirements and usage notes
 
-- Node.js 22.19 or newer is required. The current release is tested with Pi 0.84.4.
+- Node.js 22.19 or newer and Pi 0.84.4 are required; this package does not promise compatibility with other Pi SDK versions.
 - Workers are fixed to `openai-codex/gpt-5.6-luna` with `medium` thinking. Your normal Pi credential store must have access to that model; this package does not include or manage credentials.
-- Parallel model calls consume provider quota. A 16-worker run can use substantially more tokens and requests than a single-agent task, so delegate only work that benefits from independent lanes.
-- Workers run under the same operating-system account and workspace permissions as the parent Pi. Install and run the package only in trusted workspaces, and review worker changes before accepting them.
-- `npm run check` uses offline unit and packaging tests and does not call a model. The `test:live:*` scripts make real networked model calls and may consume quota.
+- A delegated worker `cwd` must resolve inside the parent Pi working directory; relative, absolute, and symlinked escapes are rejected before worker startup. This is a working-directory boundary, not a filesystem sandbox: worker tools still run under the same operating-system account and may accept absolute paths.
+- Install and run the package only in trusted workspaces, and review worker changes before accepting them.
+- `npm run check` uses offline unit and packaging tests and does not call a model. `npm run test:live` is the explicit networked acceptance aggregate; it makes real model calls and consumes provider quota.
 
 No npm publication or GitHub Release is required. Installing directly from this repository is the supported distribution path.
 
@@ -80,7 +80,7 @@ Unlike v0.1, workers do not start complete Pi CLI child processes. They use the 
 - dispose-after-run and reload-on-resume to keep memory bounded;
 - no extension recursion;
 - profile-bound tools: `explore` gets only `read`; `coder` gets `read`, `bash`, `edit`, and `write`;
-- bounded public output and usage accounting.
+- bounded public output and usage metadata.
 
 ## Live acceptance
 

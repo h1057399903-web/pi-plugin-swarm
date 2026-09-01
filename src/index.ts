@@ -4,7 +4,7 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { Text } from "@earendil-works/pi-tui";
 import { SwarmBatch, type SwarmTaskStatus } from "./features/swarm-batch.ts";
-import { SwarmAgentRuntime, WORKER_MODEL, WORKER_THINKING_LEVEL, type WorkerProfile, type WorkerResult } from "./swarm-agent-runtime.ts";
+import { SwarmAgentRuntime, WORKER_MODEL, WORKER_THINKING_LEVEL, type WorkerResult } from "./swarm-agent-runtime.ts";
 import { getSwarmIntegration, type PublicSwarmRun, type PublicSwarmWorker } from "./public-api.ts";
 
 const MAX_TASKS = 128;
@@ -14,7 +14,7 @@ const LAUNCH_STAGGER_MS = 700;
 const STATE_TYPE = "pi-swarm-state";
 const RUN_STATE_TYPE = "pi-swarm-run-v1";
 
-export type SwarmSubagentType = WorkerProfile;
+export type SwarmSubagentType = "explore" | "coder";
 interface SwarmTask { item: string; prompt?: string; cwd?: string; timeoutMs?: number; agentId?: string; resume?: boolean; subagent_type?: SwarmSubagentType; }
 
 /** Guidance deliberately lives in the coordinator, rather than in user task text. */
@@ -81,7 +81,7 @@ export function countSwarmWorkers(args: {
 }
 
 function safeError(value: unknown): string {
-  if (value instanceof Error && ["Worker failed.", "Worker timed out.", "Worker session is unavailable.", "Worker session is busy.", "Provider rate limit."].includes(value.message)) return value.message;
+  if (value instanceof Error && ["Worker failed.", "Worker timed out.", "Worker session is unavailable.", "Worker session is busy.", "Worker cwd is outside the parent working directory.", "Provider rate limit."].includes(value.message)) return value.message;
   return "Worker failed.";
 }
 
@@ -89,7 +89,9 @@ function publicStatus(status: SwarmTaskStatus): PublicSwarmWorker["status"] {
   return status;
 }
 
-function makeWorker(runId: string, task: SwarmTask, index: number, resumable: boolean): PublicSwarmWorker {
+interface InternalSwarmWorker extends PublicSwarmWorker { output?: string; error?: string; }
+
+function makeWorker(runId: string, task: SwarmTask, index: number, resumable: boolean): InternalSwarmWorker {
   return {
     workerId: `${runId}:${index + 1}`,
     agentId: task.agentId ?? randomUUID(),
@@ -168,6 +170,9 @@ export function registerSwarmExtension(pi: ExtensionAPI): void {
     ],
     parameters: SwarmParameters,
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
+      if (!enabled) {
+        return { content: [{ type: "text", text: "Swarm mode is disabled. Run /swarm on before launching workers." }], details: { disabled: true }, isError: true };
+      }
       const shorthandTasks: SwarmTask[] = (params.items ?? []).map((item) => ({ item }));
       const newTasks = [...((params.tasks ?? []) as SwarmTask[]), ...shorthandTasks];
       // Only newly-created workers participate: a resume prompt is intentionally allowed
@@ -228,6 +233,7 @@ export function registerSwarmExtension(pi: ExtensionAPI): void {
             agentId: worker.agentId,
             ownerSessionId,
             persist: resumable,
+            parentCwd: ctx.cwd,
             resume: task.resume === true || context.attempt > 1,
             forkSessionFile: task.resume ? undefined : forkSessionFile,
             prompt,
@@ -288,7 +294,7 @@ export function registerSwarmExtension(pi: ExtensionAPI): void {
         finishedAt: run.finishedAt,
         requestedConcurrency: run.requestedConcurrency,
         activeCapacity: run.activeCapacity,
-        workers: run.workers.map(({ output: _output, error: _error, ...worker }) => worker),
+        workers: workers.map(({ output: _output, error: _error, ...worker }) => worker),
       });
       const completed = workers.filter((worker) => worker.status === "completed").length;
       const summaries = workers.map((worker) => `### Worker ${worker.index + 1}: ${worker.item} — ${worker.status}\nAgent ID: ${worker.agentId}${worker.resumable ? " (resumable)" : ""}\n${worker.output || worker.error || "(no output)"}`);
@@ -319,7 +325,7 @@ export function registerSwarmExtension(pi: ExtensionAPI): void {
   });
 }
 
-function applyWorkerResult(worker: PublicSwarmWorker, result: WorkerResult): void {
+function applyWorkerResult(worker: InternalSwarmWorker, result: WorkerResult): void {
   worker.agentId = result.agentId;
   worker.resumable = result.resumable;
   worker.status = result.status;

@@ -30,11 +30,11 @@ pi update --extensions
 
 ## 要求与使用提醒
 
-- 需要 Node.js 22.19 或更新版本。当前版本已在 Pi 0.84.4 上测试。
+- 需要 Node.js 22.19 或更新版本及 Pi 0.84.4；本包不承诺兼容其他 Pi SDK 版本。
 - Worker 固定使用 `openai-codex/gpt-5.6-luna` 和 `medium` thinking。你的常规 Pi credential store 必须有权访问该模型；本扩展不包含也不管理凭证。
-- 并行模型调用会消耗 Provider 配额。16-worker 运行可能比单 Agent 任务使用更多 token 和请求，因此只应委派真正适合独立执行的工作。
-- Worker 与父 Pi 使用相同的操作系统账户和工作区权限。请只在可信工作区安装和运行，并在接受结果前审查 worker 的修改。
-- `npm run check` 只执行离线单元测试和打包测试，不会调用模型；`test:live:*` 脚本会真实联网调用模型并可能消耗配额。
+- 委派给 worker 的 `cwd` 必须解析在父 Pi 工作目录内；相对路径、绝对路径和符号链接越界会在 worker 启动前被拒绝。这只是工作目录边界，不是文件系统沙箱：worker 工具仍以相同操作系统账户运行，并可能接受绝对路径。
+- 请只在可信工作区安装和运行，并在接受结果前审查 worker 的修改。
+- `npm run check` 只执行离线单元测试和打包测试，不会调用模型；`npm run test:live` 是显式的联网验收聚合脚本，会真实调用模型并消耗 Provider 配额。
 
 不需要发布 npm 包或创建 GitHub Release。直接从本仓库安装是受支持的分发方式。
 
@@ -80,7 +80,7 @@ pi update --extensions
 - 每轮完成后 dispose，恢复时重新加载，以控制内存；
 - 不递归加载扩展；
 - Profile 绑定工具：`explore` 只有 `read`；`coder` 有 `read`、`bash`、`edit` 和 `write`；
-- 公共输出和 usage accounting 均有边界限制。
+- 公共输出和 usage metadata 均有边界限制。
 
 ## 真实验收
 

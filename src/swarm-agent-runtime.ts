@@ -7,7 +7,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { createHash } from "node:crypto";
 import { realpath } from "node:fs/promises";
-import { join, relative, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve, win32 } from "node:path";
 
 export const WORKER_MODEL = "openai-codex/gpt-5.6-luna";
 export const WORKER_THINKING_LEVEL = "medium" as const;
@@ -23,7 +23,7 @@ const PROFILE_TOOLS: Record<WorkerProfile, string[]> = {
   coder: ["read", "bash", "edit", "write"],
 };
 export interface WorkerInput {
-  workerId: string; prompt: string; cwd: string; item?: unknown; timeoutMs?: number;
+  workerId: string; prompt: string; cwd: string; parentCwd?: string; item?: unknown; timeoutMs?: number;
   profile?: WorkerProfile; subagentType?: WorkerProfile; subagent_type?: WorkerProfile; agentId?: string; ownerSessionId?: string; persist?: boolean; resume?: boolean; forkSessionFile?: string;
 }
 export interface WorkerProgress { workerId: string; status: WorkerStatus; turns: number; output?: string; profile?: WorkerProfile; item?: unknown; }
@@ -83,12 +83,13 @@ function safeError(error: unknown): string {
   if (isRateLimit(error)) return "Provider rate limit.";
   if (error instanceof Error) {
     if (error.name === "AbortError") return "Aborted.";
-    if (["Worker model is unavailable.", "Worker session is unavailable.", "Worker session is busy.", "Worker timed out.", "Worker profile mismatch."].includes(error.message)) return error.message;
+    if (["Worker model is unavailable.", "Worker session is unavailable.", "Worker session is busy.", "Worker timed out.", "Worker profile mismatch.", CWD_UNAVAILABLE].includes(error.message)) return error.message;
   }
   return "Worker failed.";
 }
 
 const SESSION_UNAVAILABLE = "Worker session is unavailable.";
+const CWD_UNAVAILABLE = "Worker cwd is outside the parent working directory.";
 const ACTIVE_AGENTS_KEY = Symbol.for("pi-plugin-swarm.active-agents.v1");
 type GlobalWithActiveAgents = typeof globalThis & { [ACTIVE_AGENTS_KEY]?: Set<string> };
 function activeAgents(): Set<string> {
@@ -101,10 +102,14 @@ function ownerScope(ownerSessionId: string): string {
 function sessionDirectory(agentDir: string, ownerSessionId: string): string {
   return join(agentDir, "swarm", "sessions", ownerScope(ownerSessionId));
 }
-function isInside(path: string, directory: string): boolean {
-  const rel = relative(resolve(directory), resolve(path));
-  return rel === "" || (!rel.startsWith("..") && !rel.startsWith("/"));
+/** Compare canonical paths without depending on the host OS (tests cover both syntaxes). */
+export function isPathInside(path: string, directory: string): boolean {
+  const windows = /^[A-Za-z]:[\\/]/.test(path) || /^[A-Za-z]:[\\/]/.test(directory) || path.includes("\\\\") || directory.includes("\\\\");
+  const pathApi = windows ? win32 : { relative, resolve };
+  const rel = pathApi.relative(pathApi.resolve(directory), pathApi.resolve(path));
+  return rel === "" || (!rel.startsWith("..") && !rel.startsWith("/") && !rel.startsWith("\\"));
 }
+
 function unavailable(): Error {
   const error = new Error(SESSION_UNAVAILABLE);
   (error as any).safeMessage = SESSION_UNAVAILABLE;
@@ -114,7 +119,7 @@ function unavailable(): Error {
 /** In-process Pi worker pool facade with opt-in owner-scoped persistent sessions. */
 export class SwarmAgentRuntime {
   private runtimePromise?: Promise<any>;
-  private readonly workers = new Map<string, { controller: AbortController; session?: any; cleaned: boolean }>();
+  private readonly workers = new Map<string, { controller: AbortController; session?: any; cleanupPromise?: Promise<void> }>();
   private readonly seams: RuntimeSeams;
   constructor(seams: RuntimeSeams = {}) { this.seams = seams; }
 
@@ -132,7 +137,7 @@ export class SwarmAgentRuntime {
     const resumable = input.persist === true;
     let sessionAvailable = false;
     const agentKey = resumable && input.agentId ? `${ownerScope(input.ownerSessionId || "anonymous")}:${input.agentId}` : undefined;
-    const state = { controller: new AbortController(), cleaned: false, session: undefined as any };
+    const state = { controller: new AbortController(), session: undefined as any, cleanupPromise: undefined as Promise<void> | undefined };
     this.workers.set(input.workerId, state);
     let turns = 0; let output = "";
     let lastOutputProgressAt = -Infinity;
@@ -162,20 +167,35 @@ export class SwarmAgentRuntime {
       }
       const aborted = new Promise<never>((_, reject) => state.controller.signal.addEventListener("abort", () => reject(state.controller.signal.reason || new Error("Aborted.")), { once: true }));
       const operation = (async () => {
+        let workerCwd = input.cwd;
         if (requestedProfile && requestedProfile !== "explore" && requestedProfile !== "coder") throw Object.assign(new Error("Worker profile mismatch."), { safeMessage: "Worker profile mismatch." });
+        if (input.parentCwd) {
+          const canonicalize = this.seams.realpathFactory ?? realpath;
+          let canonicalParent: string;
+          let canonicalCwd: string;
+          try {
+            const requestedCwd = isAbsolute(input.cwd) || win32.isAbsolute(input.cwd) ? input.cwd : resolve(input.parentCwd, input.cwd);
+            [canonicalParent, canonicalCwd] = await Promise.all([canonicalize(input.parentCwd), canonicalize(requestedCwd)]);
+          } catch {
+            throw Object.assign(new Error(CWD_UNAVAILABLE), { safeMessage: CWD_UNAVAILABLE });
+          }
+          if (!isPathInside(canonicalCwd, canonicalParent)) throw Object.assign(new Error(CWD_UNAVAILABLE), { safeMessage: CWD_UNAVAILABLE });
+          workerCwd = canonicalCwd;
+        }
+        state.controller.signal.throwIfAborted();
         const runtime = await this.runtime();
         state.controller.signal.throwIfAborted();
         const model = runtime?.getModel?.("openai-codex", "gpt-5.6-luna") ?? runtime?.getModel?.(WORKER_MODEL);
         if (!model) throw new Error("Worker model is unavailable.");
-        const loader = this.seams.resourceLoaderFactory?.(input.cwd) ?? new DefaultResourceLoader({
-          cwd: input.cwd, agentDir: getAgentDir(), noExtensions: true, noPromptTemplates: true, noThemes: true,
+        const loader = this.seams.resourceLoaderFactory?.(workerCwd) ?? new DefaultResourceLoader({
+          cwd: workerCwd, agentDir: getAgentDir(), noExtensions: true, noPromptTemplates: true, noThemes: true,
           noSkills: true, noContextFiles: true, appendSystemPrompt: [SAFETY_POLICY],
         });
         await (loader as { reload?: () => Promise<void> }).reload?.();
         state.controller.signal.throwIfAborted();
         let sessionManager: any;
         if (!resumable) {
-          sessionManager = this.seams.sessionManagerFactory?.(input.cwd) ?? SessionManager.inMemory(input.cwd);
+          sessionManager = this.seams.sessionManagerFactory?.(workerCwd) ?? SessionManager.inMemory(workerCwd);
         } else {
           const ownerDir = sessionDirectory(this.seams.agentDirFactory?.() ?? getAgentDir(), input.ownerSessionId || "anonymous");
           if (input.resume) {
@@ -187,8 +207,8 @@ export class SwarmAgentRuntime {
               if (!match) throw unavailable();
               const canonicalize = this.seams.realpathFactory ?? realpath;
               const [canonicalOwnerDir, canonicalSessionPath] = await Promise.all([canonicalize(ownerDir), canonicalize(match.path)]);
-              if (!isInside(canonicalSessionPath, canonicalOwnerDir)) throw unavailable();
-              sessionManager = this.seams.sessionOpenFactory?.(canonicalSessionPath, ownerDir, input.cwd) ?? SessionManager.open(canonicalSessionPath, ownerDir, input.cwd);
+              if (!isPathInside(canonicalSessionPath, canonicalOwnerDir)) throw unavailable();
+              sessionManager = this.seams.sessionOpenFactory?.(canonicalSessionPath, ownerDir, workerCwd) ?? SessionManager.open(canonicalSessionPath, ownerDir, workerCwd);
               const entries = sessionManager.getEntries?.() || match.entries || [];
               const metadata = [...entries].reverse().find((entry: any) => entry?.type === "custom" && entry.customType === WORKER_METADATA_TYPE)?.data;
               const recoveredProfile: WorkerProfile = metadata?.profile === "explore" || metadata?.profile === "coder" ? metadata.profile : DEFAULT_WORKER_PROFILE;
@@ -202,9 +222,9 @@ export class SwarmAgentRuntime {
               throw unavailable();
             }
           } else if (input.forkSessionFile) {
-            sessionManager = this.seams.sessionForkFactory?.(input.forkSessionFile, input.cwd, ownerDir, input.agentId) ?? SessionManager.forkFrom(input.forkSessionFile, input.cwd, ownerDir, { id: input.agentId });
+            sessionManager = this.seams.sessionForkFactory?.(input.forkSessionFile, workerCwd, ownerDir, input.agentId) ?? SessionManager.forkFrom(input.forkSessionFile, workerCwd, ownerDir, { id: input.agentId });
           } else {
-            sessionManager = this.seams.sessionCreateFactory?.(input.cwd, ownerDir, input.agentId) ?? SessionManager.create(input.cwd, ownerDir, { id: input.agentId });
+            sessionManager = this.seams.sessionCreateFactory?.(workerCwd, ownerDir, input.agentId) ?? SessionManager.create(workerCwd, ownerDir, { id: input.agentId });
           }
         }
         sessionAvailable = resumable;
@@ -215,7 +235,7 @@ export class SwarmAgentRuntime {
         }
         const tools = PROFILE_TOOLS[profile];
         const created = await (this.seams.sessionFactory || createAgentSession)({
-          cwd: input.cwd, modelRuntime: runtime, model, thinkingLevel: WORKER_THINKING_LEVEL,
+          cwd: workerCwd, modelRuntime: runtime, model, thinkingLevel: WORKER_THINKING_LEVEL,
           sessionManager, resourceLoader: loader, tools,
         });
         state.session = created.session;
@@ -255,7 +275,15 @@ export class SwarmAgentRuntime {
   }
 
   abort(workerId: string): boolean { const worker = this.workers.get(workerId); if (!worker) return false; worker.controller.abort(); void worker.session?.abort?.(); return true; }
-  async cleanup(workerId: string): Promise<void> { const worker = this.workers.get(workerId); if (!worker || worker.cleaned) return; worker.cleaned = true; try { worker.session?.dispose?.(); } finally { this.workers.delete(workerId); } }
+  async cleanup(workerId: string): Promise<void> {
+    const worker = this.workers.get(workerId);
+    if (!worker) return;
+    worker.cleanupPromise ??= (async () => {
+      try { await Promise.resolve(worker.session?.dispose?.()); }
+      finally { this.workers.delete(workerId); }
+    })();
+    await worker.cleanupPromise;
+  }
 }
 
 export const createSwarmAgentRuntime = (seams?: RuntimeSeams) => new SwarmAgentRuntime(seams);

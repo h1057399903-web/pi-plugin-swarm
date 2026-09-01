@@ -8,7 +8,8 @@ tarball="$(npm pack --silent --pack-destination "$tmp")"
 mkdir "$tmp/app"
 cd "$tmp/app"
 npm init -y >/dev/null
-npm install --ignore-scripts "$tmp/$tarball" >/dev/null
+npm install --offline --ignore-scripts "$tmp/$tarball" >/dev/null
+node -e 'const assert=require("node:assert/strict"); const pkg=require("./node_modules/pi-plugin-swarm/package.json"); assert.deepEqual(Object.keys(pkg.exports), [".", "./core"]);'
 ext="$tmp/app/node_modules/pi-plugin-swarm/src/index.ts"
 out="$(printf '%s\n' '{"id":"state","type":"get_state"}' '{"id":"stop","type":"abort"}' | pi --no-extensions -e "$ext" --no-session --mode rpc 2>/dev/null | head -20)"
 grep -q '"id":"state"' <<<"$out"

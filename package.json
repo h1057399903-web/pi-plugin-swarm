@@ -1,6 +1,6 @@
 {
   "name": "pi-plugin-swarm",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Kimi-style in-process Luna worker swarm for the Pi coding agent",
   "license": "MIT",
   "keywords": ["pi", "pi-package", "pi-extension", "swarm", "subagent", "multi-agent"],
@@ -9,9 +9,7 @@
   "files": ["src", "test", "README.md", "README.zh-CN.md", "SECURITY.md", "LICENSE", "THIRD-PARTY-NOTICES.md"],
   "exports": {
     ".": "./src/index.ts",
-    "./core": "./src/public-api.ts",
-    "./scheduler": "./src/features/swarm-batch.ts",
-    "./runtime": "./src/swarm-agent-runtime.ts"
+    "./core": "./src/public-api.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
@@ -21,12 +19,13 @@
     "test:live:16": "node --experimental-transform-types test/live-16.mjs",
     "test:live:abort": "node --experimental-transform-types test/live-abort.mjs",
     "test:live:resume": "node --experimental-transform-types test/live-resume.mjs",
-    "check": "npm run typecheck && npm run test:unit && npm run smoke && npm run smoke:packed"
+    "check": "npm run typecheck && npm run test:unit && npm run smoke && npm run smoke:packed",
+    "test:live": "npm run test:live:16 && npm run test:live:abort && npm run test:live:resume"
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*",
+    "@earendil-works/pi-ai": "0.84.4",
+    "@earendil-works/pi-coding-agent": "0.84.4",
+    "@earendil-works/pi-tui": "0.84.4",
     "typebox": "*"
   },
   "devDependencies": {

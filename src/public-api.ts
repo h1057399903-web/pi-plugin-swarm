@@ -25,8 +25,6 @@ export interface PublicSwarmWorker {
   thinking: string;
   /** Optional safe worker profile (never a cwd or session identifier). */
   profile?: PublicSwarmProfile;
-  output?: string;
-  error?: string;
 }
 
 export interface PublicSwarmRun {
