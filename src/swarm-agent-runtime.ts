@@ -4,17 +4,25 @@ import {
   getAgentDir,
   ModelRuntime,
   SessionManager,
+  type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { createHash } from "node:crypto";
 import { realpath } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, win32 } from "node:path";
+import { Type } from "typebox";
+import { resolveWorkspaceTarget, type ResolvedWorkspaceTarget } from "./lightweight-coordination.ts";
 
 export const WORKER_MODEL = "openai-codex/gpt-5.6-luna";
 export const WORKER_THINKING_LEVEL = "medium" as const;
 export const MAX_OUTPUT_BYTES = 50 * 1024;
 export const DEFAULT_PROGRESS_THROTTLE_MS = 250;
+export const MAX_QUESTION_LENGTH = 500;
+const MAX_TOOL_CALL_COUNT = 1_000_000;
+const REPORT_BLOCKED_TOOL = "report_blocked" as const;
 
-export type WorkerStatus = "queued" | "starting" | "running" | "completed" | "failed" | "aborted" | "rate_limited";
+export type WorkerStatus = "queued" | "starting" | "running" | "completed" | "failed" | "aborted" | "rate_limited" | "blocked";
+export type WorkerToolName = "read" | "bash" | "edit" | "write" | typeof REPORT_BLOCKED_TOOL;
+export type WorkerToolCounters = Partial<Record<WorkerToolName, number>>;
 export type WorkerProfile = "explore" | "coder";
 export const DEFAULT_WORKER_PROFILE: WorkerProfile = "coder";
 const WORKER_METADATA_TYPE = "pi-plugin-swarm.worker";
@@ -25,12 +33,18 @@ const PROFILE_TOOLS: Record<WorkerProfile, string[]> = {
 export interface WorkerInput {
   workerId: string; prompt: string; cwd: string; parentCwd?: string; item?: unknown; timeoutMs?: number;
   profile?: WorkerProfile; subagentType?: WorkerProfile; subagent_type?: WorkerProfile; agentId?: string; ownerSessionId?: string; persist?: boolean; resume?: boolean; forkSessionFile?: string;
+  /** Internal run-scoped sink. Targets are already canonical and workspace-relative. */
+  onWriteTarget?: (target: ResolvedWorkspaceTarget) => void;
 }
-export interface WorkerProgress { workerId: string; status: WorkerStatus; turns: number; output?: string; profile?: WorkerProfile; item?: unknown; }
+export interface WorkerProgress {
+  workerId: string; status: WorkerStatus; turns: number; output?: string; profile?: WorkerProfile; item?: unknown;
+  toolCalls: WorkerToolCounters; currentTool?: WorkerToolName; currentTarget?: string; lastActivityAt?: number; question?: string;
+}
 export interface WorkerUsage { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number; }
 export interface WorkerResult {
   workerId: string; agentId: string; resumable: boolean; status: WorkerStatus; startedAt?: number; finishedAt: number; durationMs: number;
   turns: number; usage: WorkerUsage; output: string; profile: WorkerProfile; item?: unknown; error?: string;
+  toolCalls: WorkerToolCounters; currentTool?: WorkerToolName; currentTarget?: string; lastActivityAt?: number; question?: string;
 }
 
 export interface RuntimeSeams {
@@ -78,18 +92,20 @@ function isRateLimit(error: unknown): boolean {
   return e?.status === 429 || e?.statusCode === 429 || e?.code === 429 || e?.code === "429" ||
     e?.code === "rate_limit_exceeded" || e?.name === "APIProviderRateLimitError" || e?.name === "RateLimitError";
 }
+const SESSION_UNAVAILABLE = "Worker session is unavailable.";
+const CWD_UNAVAILABLE = "Worker cwd is outside the parent working directory.";
+const SAFE_ERROR_MESSAGES = new Set([
+  "Worker model is unavailable.", SESSION_UNAVAILABLE, "Worker session is busy.",
+  "Worker timed out.", "Worker profile mismatch.", CWD_UNAVAILABLE,
+]);
 function safeError(error: unknown): string {
-  if ((error as any)?.safeMessage) return (error as any).safeMessage;
   if (isRateLimit(error)) return "Provider rate limit.";
   if (error instanceof Error) {
     if (error.name === "AbortError") return "Aborted.";
-    if (["Worker model is unavailable.", "Worker session is unavailable.", "Worker session is busy.", "Worker timed out.", "Worker profile mismatch.", CWD_UNAVAILABLE].includes(error.message)) return error.message;
+    if (SAFE_ERROR_MESSAGES.has(error.message)) return error.message;
   }
   return "Worker failed.";
 }
-
-const SESSION_UNAVAILABLE = "Worker session is unavailable.";
-const CWD_UNAVAILABLE = "Worker cwd is outside the parent working directory.";
 const ACTIVE_AGENTS_KEY = Symbol.for("pi-plugin-swarm.active-agents.v1");
 type GlobalWithActiveAgents = typeof globalThis & { [ACTIVE_AGENTS_KEY]?: Set<string> };
 function activeAgents(): Set<string> {
@@ -139,19 +155,44 @@ export class SwarmAgentRuntime {
     const agentKey = resumable && input.agentId ? `${ownerScope(input.ownerSessionId || "anonymous")}:${input.agentId}` : undefined;
     const state = { controller: new AbortController(), session: undefined as any, cleanupPromise: undefined as Promise<void> | undefined };
     this.workers.set(input.workerId, state);
-    let turns = 0; let output = "";
+    let turns = 0; let output = ""; let question: string | undefined;
+    let terminal = false;
     let lastOutputProgressAt = -Infinity;
+    let lastActivityProgressAt = -Infinity;
+    let lastActivityAt: number | undefined;
+    let workspaceRoot: string | undefined;
+    let canonicalWorkerCwd: string | undefined;
+    const toolCalls: WorkerToolCounters = {};
+    const activeTools = new Map<string, { toolName: WorkerToolName; target?: string }>();
+    const pendingTargets = new Set<Promise<void>>();
     const progressThrottleMs = Math.max(0, this.seams.progressThrottleMs ?? DEFAULT_PROGRESS_THROTTLE_MS);
     const usage: WorkerUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
+    const activity = () => {
+      const current = [...activeTools.values()].at(-1);
+      return {
+        toolCalls: { ...toolCalls },
+        ...(current ? { currentTool: current.toolName, ...(current.target ? { currentTarget: current.target } : {}) } : {}),
+        ...(lastActivityAt === undefined ? {} : { lastActivityAt }),
+        ...(question ? { question } : {}),
+      };
+    };
     const report = (status: WorkerStatus, chunk?: string) => {
-      onProgress?.({ workerId: input.workerId, status, turns, output: chunk, ...(metadataResolved ? { profile, item } : {}) });
+      onProgress?.({ workerId: input.workerId, status, turns, output: chunk, ...activity(), ...(metadataResolved ? { profile, item } : {}) });
     };
     const reportOutput = () => {
       const now = this.seams.now?.() ?? Date.now();
       if (now - lastOutputProgressAt < progressThrottleMs) return;
       lastOutputProgressAt = now;
-      onProgress?.({ workerId: input.workerId, status: "running", turns, output: cap(output), ...(metadataResolved ? { profile, item } : {}) });
+      report("running", cap(output));
     };
+    const reportActivity = () => {
+      const now = this.seams.now?.() ?? Date.now();
+      if (now - lastActivityProgressAt < progressThrottleMs) return;
+      lastActivityProgressAt = now;
+      report("running");
+    };
+    const safeToolName = (value: unknown): WorkerToolName | undefined =>
+      value === "read" || value === "bash" || value === "edit" || value === "write" || value === REPORT_BLOCKED_TOOL ? value : undefined;
     report("queued");
     report("starting");
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -181,6 +222,8 @@ export class SwarmAgentRuntime {
           }
           if (!isPathInside(canonicalCwd, canonicalParent)) throw Object.assign(new Error(CWD_UNAVAILABLE), { safeMessage: CWD_UNAVAILABLE });
           workerCwd = canonicalCwd;
+          workspaceRoot = canonicalParent;
+          canonicalWorkerCwd = canonicalCwd;
         }
         state.controller.signal.throwIfAborted();
         const runtime = await this.runtime();
@@ -233,39 +276,95 @@ export class SwarmAgentRuntime {
         if (resumable && !input.resume) {
           sessionManager.appendCustomEntry?.(WORKER_METADATA_TYPE, { profile, item: input.item });
         }
-        const tools = PROFILE_TOOLS[profile];
+        const blockedTool: ToolDefinition = {
+          name: REPORT_BLOCKED_TOOL,
+          label: "Report blocked",
+          description: "Stop this worker and return one bounded question to the coordinator when the task cannot safely continue.",
+          parameters: Type.Object({ question: Type.String({ minLength: 1, maxLength: MAX_QUESTION_LENGTH }) }),
+          execute: async (_toolCallId, params: any) => {
+            question = String(params.question).slice(0, MAX_QUESTION_LENGTH);
+            lastActivityAt = this.seams.now?.() ?? Date.now();
+            reportActivity();
+            return { content: [{ type: "text", text: "Blocked question recorded for the coordinator." }], details: undefined, terminate: true };
+          },
+        };
+        const tools = [...PROFILE_TOOLS[profile], REPORT_BLOCKED_TOOL];
         const created = await (this.seams.sessionFactory || createAgentSession)({
           cwd: workerCwd, modelRuntime: runtime, model, thinkingLevel: WORKER_THINKING_LEVEL,
-          sessionManager, resourceLoader: loader, tools,
+          sessionManager, resourceLoader: loader, tools, customTools: [blockedTool],
         });
         state.session = created.session;
         if (state.controller.signal.aborted) {
           try { await Promise.resolve(state.session?.dispose?.()); } finally { state.session = undefined; }
           state.controller.signal.throwIfAborted();
         }
+        const trackTarget = (event: any) => {
+          if (!workspaceRoot || !canonicalWorkerCwd || typeof event.args?.path !== "string") return;
+          let pending!: Promise<void>;
+          pending = resolveWorkspaceTarget({
+            workspaceRoot,
+            workingDirectory: canonicalWorkerCwd,
+            target: event.args.path,
+            realpath: this.seams.realpathFactory ?? realpath,
+            rootsAreCanonical: true,
+          }).then((target) => {
+            if (terminal || !target) return;
+            const active = activeTools.get(event.toolCallId);
+            if (active) active.target = target.relativePath;
+            if (event.toolName === "edit" || event.toolName === "write") {
+              try { input.onWriteTarget?.(target); } catch { /* Advisory observers never affect tool execution. */ }
+            }
+          }).catch(() => { /* Unknown or unsafe targets are deliberately omitted. */ })
+            .finally(() => {
+              pendingTargets.delete(pending);
+              if (!terminal) reportActivity();
+            });
+          pendingTargets.add(pending);
+        };
         unsubscribe = state.session.subscribe?.((event: any) => {
+          if (terminal) return;
           if (event.type === "turn_start") { turns++; report("running"); }
           if (event.type === "message_update") {
             const delta = event.assistantMessageEvent?.delta || ""; if (delta) { output += delta; reportOutput(); }
           }
           if (event.type === "message_end" && event.message?.role === "assistant") { output = textOf(event.message.content) || output; addUsage(usage, usageOf(event.message)); }
+          if (event.type === "tool_execution_start") {
+            const toolName = safeToolName(event.toolName);
+            if (!toolName || typeof event.toolCallId !== "string") return;
+            toolCalls[toolName] = Math.min((toolCalls[toolName] ?? 0) + 1, MAX_TOOL_CALL_COUNT);
+            activeTools.set(event.toolCallId, { toolName });
+            lastActivityAt = this.seams.now?.() ?? Date.now();
+            if (toolName === "read" || toolName === "edit" || toolName === "write") trackTarget(event);
+            else reportActivity();
+          }
+          if (event.type === "tool_execution_end" && typeof event.toolCallId === "string") {
+            activeTools.delete(event.toolCallId);
+            lastActivityAt = this.seams.now?.() ?? Date.now();
+            reportActivity();
+          }
         });
         report("running");
         await state.session.prompt(input.prompt, { signal: state.controller.signal });
         state.controller.signal.throwIfAborted();
+        for (const pendingTarget of [...pendingTargets]) await pendingTarget.catch(() => undefined);
       })();
       await Promise.race([operation, aborted, ...(timeout ? [timeout] : [])]);
       if (!output) { const messages = state.session.messages || state.session.agent?.state?.messages || []; for (let i = messages.length - 1; i >= 0; i--) if (messages[i]?.role === "assistant") { output = textOf(messages[i].content); addUsage(usage, usageOf(messages[i])); break; } }
-      report("completed");
+      const resultStatus: WorkerStatus = question ? "blocked" : "completed";
+      terminal = true;
+      activeTools.clear();
+      report(resultStatus);
       const finished = this.seams.now?.() ?? Date.now();
-      return { workerId: input.workerId, agentId, resumable: resumable && sessionAvailable, status: "completed", startedAt: started, finishedAt: finished, durationMs: finished - started, turns, usage, output: cap(output), profile, item };
+      return { workerId: input.workerId, agentId, resumable: resumable && sessionAvailable, status: resultStatus, startedAt: started, finishedAt: finished, durationMs: finished - started, turns, usage, output: cap(output), profile, item, ...activity() };
     } catch (error) {
       const aborted = !timedOut && (state.controller.signal.aborted || (error as any)?.name === "AbortError");
       const rate = isRateLimit(error);
       const resultStatus: WorkerStatus = rate ? "rate_limited" : aborted ? "aborted" : "failed";
+      terminal = true;
+      activeTools.clear();
       report(resultStatus);
       const finished = this.seams.now?.() ?? Date.now();
-      return { workerId: input.workerId, agentId, resumable: resumable && sessionAvailable, status: resultStatus, startedAt: started, finishedAt: finished, durationMs: finished - started, turns, usage, output: cap(output), profile, item, error: timedOut ? "Worker timed out." : safeError(error) };
+      return { workerId: input.workerId, agentId, resumable: resumable && sessionAvailable, status: resultStatus, startedAt: started, finishedAt: finished, durationMs: finished - started, turns, usage, output: cap(output), profile, item, error: timedOut ? "Worker timed out." : safeError(error), ...activity() };
     } finally {
       if (timer) clearTimeout(timer);
       unsubscribe?.();
