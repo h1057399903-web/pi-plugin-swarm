@@ -98,6 +98,17 @@ function sessionFor(text, delay = 0) {
   assert.equal(result.status, "rate_limited"); assert.equal(result.error, "Provider rate limit."); assert.doesNotMatch(result.error, /SECRET/);
 }
 
+// Arbitrary safeMessage properties are not a bypass for bounded error projection.
+{
+  const r = new SwarmAgentRuntime(seams(() => {
+    const s = sessionFor("");
+    s.prompt = async () => { throw Object.assign(new Error("provider body"), { safeMessage: "SECRET provider payload" }); };
+    return s;
+  }));
+  const result = await r.run({ workerId: "unsafe-safe-message", prompt: "x", cwd: "/tmp" });
+  assert.equal(result.error, "Worker failed.");
+}
+
 // token progress is throttled so a 16-worker run cannot flood the parent TUI
 {
   let now = 1_000;
@@ -112,6 +123,96 @@ function sessionFor(text, delay = 0) {
   const result = await r.run({ workerId: "throttle", prompt: "x", cwd: "/tmp" }, (progress) => updates.push(progress));
   assert.equal(result.output.length, 100);
   assert.equal(updates.filter((update) => update.output).length, 1);
+}
+
+// Tool/session events derive bounded telemetry without one progress update per event.
+{
+  let listener;
+  const writes = [];
+  const s = sessionFor("telemetry");
+  s.subscribe = (fn) => { listener = fn; return () => {}; };
+  s.prompt = async () => {
+    listener({ type: "turn_start" });
+    for (let i = 0; i < 100; i++) {
+      const toolName = i % 4 === 0 ? "read" : i % 4 === 1 ? "edit" : i % 4 === 2 ? "write" : "bash";
+      const toolCallId = `tool-${i}`;
+      listener({ type: "tool_execution_start", toolCallId, toolName, args: { path: i === 1 ? "src/auth.ts" : `src/${i}.ts` } });
+      listener({ type: "tool_execution_end", toolCallId, toolName, result: {}, isError: false });
+    }
+    s.messages.push({ role: "assistant", content: [{ type: "text", text: "telemetry" }] });
+  };
+  const updates = [];
+  const result = await new SwarmAgentRuntime(seams(() => s, { now: () => 1_000, progressThrottleMs: 250 })).run({
+    workerId: "tools", prompt: "x", cwd: "/repo", parentCwd: "/repo",
+    onWriteTarget: (target) => writes.push(target),
+  }, (progress) => updates.push(progress));
+  assert.equal(result.status, "completed");
+  assert.deepEqual(result.toolCalls, { read: 25, edit: 25, write: 25, bash: 25 });
+  assert.equal(result.lastActivityAt, 1_000);
+  assert.ok(updates.length <= 7, `tool progress must be coalesced, received ${updates.length}`);
+  assert.ok(writes.some((target) => target.relativePath === "src/auth.ts"));
+  const beforeLate = updates.length;
+  listener({ type: "tool_execution_start", toolCallId: "late", toolName: "bash", args: {} });
+  assert.equal(updates.length, beforeLate, "late tool events cannot revive a terminal worker");
+  assert.equal(updates.at(-1).status, "completed");
+}
+
+// Sixteen high-activity fake workers retain full concurrency while progress stays bounded.
+{
+  let active = 0; let peak = 0; let emitted = 0; let toolEvents = 0;
+  const runtime = new SwarmAgentRuntime(seams(() => {
+    const listeners = new Set();
+    return {
+      messages: [],
+      subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn); },
+      async prompt() {
+        active++; peak = Math.max(peak, active);
+        listeners.forEach((listener) => listener({ type: "turn_start" }));
+        for (let index = 0; index < 100; index++) {
+          toolEvents += 2;
+          listeners.forEach((listener) => listener({ type: "tool_execution_start", toolCallId: `bash-${index}`, toolName: "bash", args: {} }));
+          listeners.forEach((listener) => listener({ type: "tool_execution_end", toolCallId: `bash-${index}`, toolName: "bash", result: {}, isError: false }));
+        }
+        await Promise.resolve();
+        active--;
+      },
+      dispose() {}, abort() {},
+    };
+  }, { now: () => 2_000, progressThrottleMs: 250 }));
+  const results = await Promise.all(Array.from({ length: 16 }, (_, index) => runtime.run({ workerId: `stress-${index}`, prompt: "x", cwd: "/tmp" }, () => emitted++)));
+  assert.equal(peak, 16);
+  assert.equal(toolEvents, 3_200);
+  assert.ok(results.every((result) => result.status === "completed" && result.toolCalls.bash === 100));
+  assert.ok(emitted <= 16 * 7, `3,200 tool events emitted ${emitted} progress updates`);
+}
+
+// A bounded report_blocked tool creates a structured terminal result and can resume the same agent.
+{
+  let created = 0;
+  const manager = { getSessionId: () => "agent-question", getEntries: () => [{ type: "custom", customType: "pi-plugin-swarm.worker", data: { profile: "coder", item: "contract" } }] };
+  const seam = seams((options) => {
+    const session = sessionFor(created++ === 0 ? "" : "continued");
+    if (created === 1) session.prompt = async () => {
+      const tool = options.customTools.find((candidate) => candidate.name === "report_blocked");
+      await tool.execute("blocked", { question: "q".repeat(600) });
+    };
+    return session;
+  }, {
+    agentDirFactory: () => "/test-agent",
+    sessionCreateFactory: () => manager,
+    sessionListFactory: async (dir) => [{ id: "agent-question", path: join(dir, "agent-question.jsonl") }],
+    sessionOpenFactory: () => manager,
+  });
+  const runtime = new SwarmAgentRuntime(seam);
+  const blocked = await runtime.run({ workerId: "question-1", agentId: "agent-question", ownerSessionId: "owner", persist: true, item: "contract", prompt: "x", cwd: "/work" });
+  assert.equal(blocked.status, "blocked");
+  assert.equal(blocked.question.length, 500);
+  assert.equal(blocked.agentId, "agent-question");
+  assert.equal(blocked.resumable, true);
+  const resumed = await runtime.run({ workerId: "question-2", agentId: blocked.agentId, ownerSessionId: "owner", persist: true, resume: true, prompt: "answer", cwd: "/work" });
+  assert.equal(resumed.status, "completed");
+  assert.equal(resumed.output, "continued");
+  assert.equal(resumed.agentId, blocked.agentId);
 }
 
 // persistent sessions are owner-scoped, identify the worker, and dispose after each run
@@ -202,11 +303,32 @@ function sessionFor(text, delay = 0) {
   assert.equal(result.error, "Worker timed out.");
 }
 
+// A target canonicalization that finishes after timeout cannot mutate run coordination.
+{
+  let listener; let writes = 0;
+  const session = sessionFor("");
+  session.subscribe = (fn) => { listener = fn; return () => {}; };
+  session.prompt = () => {
+    listener({ type: "tool_execution_start", toolCallId: "late-write", toolName: "write", args: { path: "src/late.ts" } });
+    return new Promise(() => {});
+  };
+  const runtime = new SwarmAgentRuntime(seams(() => session, {
+    realpathFactory: async (path) => {
+      if (path.endsWith("late.ts")) await new Promise((resolve) => setTimeout(resolve, 30));
+      return path;
+    },
+  }));
+  const result = await runtime.run({ workerId: "late-target", prompt: "x", cwd: "/repo", parentCwd: "/repo", timeoutMs: 10, onWriteTarget: () => { writes++; } });
+  assert.equal(result.status, "failed");
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  assert.equal(writes, 0);
+}
+
 // a session created after timeout is immediately disposed instead of leaking
 {
   let lateSession;
   const r = new SwarmAgentRuntime(seams(() => (lateSession = sessionFor("late")), {
-    sessionFactory: async (options) => {
+    sessionFactory: async (_options) => {
       await new Promise((resolve) => setTimeout(resolve, 30));
       return { session: (lateSession = sessionFor("late")) };
     },
@@ -225,7 +347,7 @@ function sessionFor(text, delay = 0) {
   });
   await new SwarmAgentRuntime(seam).run({ workerId: "explore", profile: "explore", item: "inspect", prompt: "x", cwd: "/work", persist: true });
   await new SwarmAgentRuntime(seam).run({ workerId: "coder", profile: "coder", item: "change", prompt: "x", cwd: "/work", persist: false });
-  assert.deepEqual(options.map((o) => o.tools), [["read"], ["read", "bash", "edit", "write"]]);
+  assert.deepEqual(options.map((o) => o.tools), [["read", "report_blocked"], ["read", "bash", "edit", "write", "report_blocked"]]);
   assert.deepEqual(entries[0], { type: "pi-plugin-swarm.worker", data: { profile: "explore", item: "inspect" } });
 }
 
@@ -239,13 +361,13 @@ function sessionFor(text, delay = 0) {
     sessionOpenFactory: () => (opened = manager({ profile: "explore", item: "original" })),
   });
   const recovered = await new SwarmAgentRuntime(seam).run({ workerId: "recover", agentId: "saved", item: "replacement", ownerSessionId: "owner", persist: true, resume: true, prompt: "x", cwd: "/work" });
-  assert.equal(recovered.profile, "explore"); assert.equal(recovered.item, "original"); assert.deepEqual(options[0].tools, ["read"]); assert.equal(opened !== undefined, true);
+  assert.equal(recovered.profile, "explore"); assert.equal(recovered.item, "original"); assert.deepEqual(options[0].tools, ["read", "report_blocked"]); assert.equal(opened !== undefined, true);
 
   const legacy = new SwarmAgentRuntime(seams((o) => { options.push(o); return sessionFor("legacy"); }, {
     agentDirFactory: () => "/test-agent", sessionListFactory: async (dir) => [{ id: "legacy", path: join(dir, "legacy.jsonl") }], sessionOpenFactory: () => manager(undefined),
   }));
   const old = await legacy.run({ workerId: "legacy", agentId: "legacy", ownerSessionId: "owner", persist: true, resume: true, prompt: "x", cwd: "/work" });
-  assert.equal(old.profile, "coder"); assert.deepEqual(options.at(-1).tools, ["read", "bash", "edit", "write"]);
+  assert.equal(old.profile, "coder"); assert.deepEqual(options.at(-1).tools, ["read", "bash", "edit", "write", "report_blocked"]);
 
   const escalation = await new SwarmAgentRuntime(seams(() => sessionFor("must-not-run"), {
     agentDirFactory: () => "/test-agent", sessionListFactory: async (dir) => [{ id: "saved", path: join(dir, "saved.jsonl") }], sessionOpenFactory: () => manager({ profile: "explore", item: "original" }),

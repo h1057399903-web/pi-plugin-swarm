@@ -54,9 +54,21 @@ pi update --extensions
 
 - 新任务会先根据任务 prompt（或 `prompt_template`/`promptTemplate` 与 `{{item}}`）渲染，再启动 worker。渲染后的新任务 prompt 重复时，会在创建 Session 前拒绝；恢复项有意不参与此检查。
 - `resume_agent_ids` 将已有 `agentId` 映射到后续 prompt，并优先启动这些 worker。恢复要求父 Session 已持久化；`--no-session` 的 worker 位于内存中，不能 resume 或 fork。
-- 遇到 rate limit 的重试在等待指数退避时会以临时 `suspended` telemetry 呈现；重试预算耗尽后终态为 `rate_limited`。进度会包含尝试次数以及活动容量的收缩/恢复。公共 integration snapshot/event 只暴露受限的状态、身份、时间、模型/profile 元数据和 usage，不暴露 transcript、路径或凭证值。
+- 遇到 rate limit 的重试在等待指数退避时会以临时 `suspended` telemetry 呈现；重试预算耗尽后终态为 `rate_limited`。进度会包含尝试次数以及活动容量的收缩/恢复。公共 integration snapshot/event 只暴露受限的状态、身份、时间、模型/profile、usage 与安全的 workspace-relative 协调元数据，不暴露 transcript、绝对路径或凭证值。
 - Worker 不得启动或委派其他 worker；本扩展不支持嵌套 swarm。
 - 对仍可恢复但未完成的 worker，协调器会收到 `resume_agent_ids: {"<agentId>": "..."}` 形式的 resume hint。
+
+## v0.5 轻量协调
+
+v0.5 从现有 Pi session 事件派生有边界的进度信息：每个 worker 的工具调用计数、当前工具、当前安全目标和最后活动时间戳。公共 run/worker 更新会合并；这不会增加模型调用。计数和活动信息只是观测，不是第二条执行通道。
+
+只有 edit/write 工具事件会进入按 run 作用域的 advisory overlap registry。目标会被 canonicalize，并且只以有边界的、相对于 workspace 的路径公开（每个 worker 最多 32 个文件）；它只报告重叠写入者，不加锁、不预留、不取消，也不改变文件所有权。该 registry 刻意不声称 `bash` 造成的副作用。registry 随 run 清理，不是持久化协调存储。
+
+Worker 还提供很小的 `report_blocked` 工具：只接受有边界的 `question`（最多 500 个字符），记录最小的 blocked 终态，并提供 terminate hint，使 session 无需单独的协调请求即可停止。它用于替代 transcript 解析，并不属于 telemetry。可持久化恢复的 blocked worker 恢复时保留同一个按 owner 隔离的 `agentId`。
+
+现有架构保持不变，默认 profile 仍是 `coder`，worker 仍是进程内 Pi SDK `AgentSession`。不存在 channels、feed、inbox、task DB、协调 memory、polling、watchers、child worker processes、持久化协调存储、peer messaging 或 filesystem sandbox。workspace-relative 边界只是安全检查，不是文件系统沙箱；工具仍以父进程的操作系统账户运行。
+
+`./core` 提供进程级公共 API，并使用 `apiVersion: 2`。v2 字段均为对调用方可选的 additive 字段：安全 profile、工具计数、当前工具/目标、最后活动、touched/overlap 文件和 blocked question。公共 snapshot/event 会安全删减 transcript、错误文本、凭证、绝对路径和 session 路径。
 
 ## 运行时模型
 
@@ -69,7 +81,7 @@ pi update --extensions
 - 遇到限流时自动收缩活动容量，之后逐步恢复；
 - 取消 batch 时会向所有运行中的 worker 传播 abort，并等待它们清理完成；
 - 保持稳定的任务和结果顺序；
-- 合并 token 进度和汇总 UI 更新，避免淹没 TUI。
+- 合并 token 进度、事件派生的活动信息和汇总 UI 更新，避免淹没 TUI；
 
 与 v0.1 不同，worker 不再启动完整的 Pi CLI 子进程，而是在宿主进程中使用官方 Pi SDK：
 
@@ -79,14 +91,12 @@ pi update --extensions
 - `--no-session` 父会话使用内存 worker；
 - 每轮完成后 dispose，恢复时重新加载，以控制内存；
 - 不递归加载扩展；
-- Profile 绑定工具：`explore` 只有 `read`；`coder` 有 `read`、`bash`、`edit` 和 `write`；
+- Profile 绑定执行工具：`explore` 有 `read`；`coder` 有 `read`、`bash`、`edit` 和 `write`；两个 profile 都有仅用于终止回传的 bounded `report_blocked`；
 - 公共输出和 usage metadata 均有边界限制。
 
 ## 真实验收
 
-v0.4 使用 16 个真实 Luna worker 完成验收。16 个 worker 全部实际调用工具并返回精确结果；峰值并发为 16，墙钟时间 23.56 秒。另一轮 16-worker abort 测试只在全部 16 个 worker 清理完成后返回，耗时 8.59 秒。持久化 resume 也保留了同一 Agent ID，并准确回忆上一轮的值。
-
-这些是可选的联网验收测试，不属于离线单元测试套件。
+v0.5 验收命令会报告墙钟时间、峰值并发和事件数量（abort 命令还会报告清理及状态数据）。这里刻意不预先编造结果：请在可信工作区运行 `npm run test:live` 获取当前 Provider-backed 结果。这些是可选的联网验收测试，不属于离线单元测试套件。
 
 ## Workbench 集成
 

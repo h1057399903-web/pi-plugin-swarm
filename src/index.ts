@@ -6,6 +6,7 @@ import { Text } from "@earendil-works/pi-tui";
 import { SwarmBatch, type SwarmTaskStatus } from "./features/swarm-batch.ts";
 import { SwarmAgentRuntime, WORKER_MODEL, WORKER_THINKING_LEVEL, type WorkerResult } from "./swarm-agent-runtime.ts";
 import { getSwarmIntegration, type PublicSwarmRun, type PublicSwarmWorker } from "./public-api.ts";
+import { LightweightCoordination } from "./lightweight-coordination.ts";
 
 const MAX_TASKS = 128;
 const MAX_CONCURRENCY = 16;
@@ -108,6 +109,9 @@ function makeWorker(runId: string, task: SwarmTask, index: number, resumable: bo
     cost: 0,
     model: WORKER_MODEL,
     thinking: WORKER_THINKING_LEVEL,
+    toolCalls: {},
+    touchedFiles: [],
+    overlapFiles: [],
   };
 }
 
@@ -198,6 +202,8 @@ export function registerSwarmExtension(pi: ExtensionAPI): void {
         return worker;
       });
       const run: PublicSwarmRun = { runId, description: params.description.slice(0, 500), status: "running", createdAt: Date.now(), requestedConcurrency, activeCapacity: requestedConcurrency, workers };
+      const coordination = new LightweightCoordination();
+      const workersById = new Map(workers.map((worker) => [worker.workerId, worker]));
 
       let publishTimer: ReturnType<typeof setTimeout> | undefined;
       let lastPublishedAt = -Infinity;
@@ -205,8 +211,9 @@ export function registerSwarmExtension(pi: ExtensionAPI): void {
         if (publishTimer) { clearTimeout(publishTimer); publishTimer = undefined; }
         lastPublishedAt = Date.now();
         integration.updateRun(run);
-        const done = workers.filter((worker) => ["completed", "failed", "aborted", "rate_limited"].includes(worker.status)).length;
-        onUpdate?.({ content: [{ type: "text", text: `Swarm: ${done}/${workers.length} finished` }], details: structuredClone(run) });
+        const done = workers.filter((worker) => ["completed", "failed", "aborted", "rate_limited", "blocked"].includes(worker.status)).length;
+        const publicRun = integration.snapshot().runs.find((candidate) => candidate.runId === runId);
+        onUpdate?.({ content: [{ type: "text", text: `Swarm: ${done}/${workers.length} finished` }], details: publicRun });
       };
       const publish = (immediate = false) => {
         const delay = 250 - (Date.now() - lastPublishedAt);
@@ -241,9 +248,25 @@ export function registerSwarmExtension(pi: ExtensionAPI): void {
             item: task.item,
             timeoutMs: task.timeoutMs,
             profile: task.resume ? undefined : task.subagent_type ?? "coder",
+            onWriteTarget: (target) => {
+              const update = coordination.recordWrite(worker.workerId, target);
+              for (const affectedWorkerId of update.affectedWorkerIds) {
+                const affectedWorker = workersById.get(affectedWorkerId);
+                if (!affectedWorker) continue;
+                const snapshot = coordination.snapshot(affectedWorkerId);
+                affectedWorker.touchedFiles = snapshot.touchedFiles;
+                affectedWorker.overlapFiles = snapshot.overlapFiles;
+              }
+              publish();
+            },
           }, (progress) => {
             worker.status = progress.status;
             worker.turns = progress.turns;
+            worker.toolCalls = progress.toolCalls;
+            worker.currentTool = progress.currentTool;
+            worker.currentTarget = progress.currentTarget;
+            if (progress.lastActivityAt !== undefined) worker.lastActivityAt = progress.lastActivityAt;
+            if (progress.question) worker.question = progress.question;
             if (typeof progress.item === "string" && progress.item) worker.item = progress.item.slice(0, 200);
             if (progress.profile !== undefined) worker.profile = publicProfile(progress.profile);
             if (progress.output) worker.output = progress.output;
@@ -283,23 +306,25 @@ export function registerSwarmExtension(pi: ExtensionAPI): void {
       try { results = await batch.run(); }
       finally { integration.setRunController(runId, undefined); }
       run.finishedAt = Date.now();
-      run.status = runSignal.aborted || results.every((result) => result.status === "aborted") ? "aborted"
-        : results.some((result) => result.status === "failed" || result.status === "rate_limited") ? "failed" : "completed";
+      if (runSignal.aborted || results.every((result) => result.status === "aborted")) run.status = "aborted";
+      else if (results.some((result) => result.status === "failed" || result.status === "rate_limited")) run.status = "failed";
+      else if (workers.some((worker) => worker.status === "blocked")) run.status = "blocked";
+      else run.status = "completed";
       publish(true);
-      pi.appendEntry(RUN_STATE_TYPE, {
-        runId: run.runId,
-        description: run.description,
-        status: run.status,
-        createdAt: run.createdAt,
-        finishedAt: run.finishedAt,
-        requestedConcurrency: run.requestedConcurrency,
-        activeCapacity: run.activeCapacity,
-        workers: workers.map(({ output: _output, error: _error, ...worker }) => worker),
-      });
+      const publicRun = integration.snapshot().runs.find((candidate) => candidate.runId === runId);
+      if (publicRun) pi.appendEntry(RUN_STATE_TYPE, publicRun);
+      const publicWorkers = new Map(publicRun?.workers.map((worker) => [worker.workerId, worker]));
       const completed = workers.filter((worker) => worker.status === "completed").length;
-      const summaries = workers.map((worker) => `### Worker ${worker.index + 1}: ${worker.item} — ${worker.status}\nAgent ID: ${worker.agentId}${worker.resumable ? " (resumable)" : ""}\n${worker.output || worker.error || "(no output)"}`);
-      const resumeHint = resumeAgentIdsHint(workers);
-      return { content: [{ type: "text", text: `Swarm completed: ${completed}/${workers.length} succeeded\n\n${summaries.join("\n\n---\n\n")}${resumeHint ? `\n\nUnfinished resumable workers can be continued with:\n${resumeHint}` : ""}` }], details: structuredClone(run) };
+      const summaries = workers.map((worker) => {
+        const publicWorker = publicWorkers.get(worker.workerId);
+        const result = worker.question
+          ? `Question: ${publicWorker?.question ?? "[redacted]"}`
+          : worker.output || worker.error || "(no output)";
+        return `### Worker ${worker.index + 1}: ${publicWorker?.item ?? "[redacted]"} — ${worker.status}\nAgent ID: ${worker.agentId}${worker.resumable ? " (resumable)" : ""}\n${result}`;
+      });
+      const resumeHint = resumeAgentIdsHint(publicRun?.workers ?? []);
+      coordination.clear();
+      return { content: [{ type: "text", text: `Swarm completed: ${completed}/${workers.length} succeeded\n\n${summaries.join("\n\n---\n\n")}${resumeHint ? `\n\nUnfinished resumable workers can be continued with:\n${resumeHint}` : ""}` }], details: publicRun };
     },
     renderCall(args, theme) {
       const count = countSwarmWorkers(args);
@@ -308,12 +333,12 @@ export function registerSwarmExtension(pi: ExtensionAPI): void {
     renderResult(result, { isPartial }, theme) {
       const run = result.details as PublicSwarmRun | undefined;
       if (!run) return new Text(result.content[0]?.type === "text" ? result.content[0].text : "", 0, 0);
-      const done = run.workers.filter((worker) => ["completed", "failed", "aborted", "rate_limited"].includes(worker.status)).length;
+      const done = run.workers.filter((worker) => ["completed", "failed", "aborted", "rate_limited", "blocked"].includes(worker.status)).length;
       const failed = run.workers.some((worker) => worker.status === "failed" || worker.status === "rate_limited");
       let text = `${isPartial ? "⏳" : failed ? "◐" : "✓"} ${done}/${run.workers.length} workers`;
       for (const worker of run.workers) {
         const status = worker.status as string;
-        const icon = status === "completed" ? "✓" : status === "failed" || status === "rate_limited" ? "✗" : status === "aborted" ? "■" : status === "suspended" ? "Ⅱ" : "⏳";
+        const icon = status === "completed" ? "✓" : status === "failed" || status === "rate_limited" ? "✗" : status === "aborted" ? "■" : status === "blocked" ? "?" : status === "suspended" ? "Ⅱ" : "⏳";
         text += `\n  ${icon} ${worker.item}${status === "suspended" ? " (suspended)" : ""}`;
         if (worker.turns) text += theme.fg("dim", ` · ${worker.turns} turns · ↓${worker.outputTokens}`);
       }
@@ -337,6 +362,11 @@ function applyWorkerResult(worker: InternalSwarmWorker, result: WorkerResult): v
   worker.outputTokens = result.usage.output;
   worker.cacheReadTokens = result.usage.cacheRead;
   worker.cost = result.usage.cost;
+  worker.toolCalls = result.toolCalls;
+  worker.currentTool = result.currentTool;
+  worker.currentTarget = result.currentTarget;
+  if (result.lastActivityAt !== undefined) worker.lastActivityAt = result.lastActivityAt;
+  if (result.question) worker.question = result.question;
   worker.output = result.output;
   worker.error = result.error;
   const recovered = result as WorkerResult & { item?: unknown; profile?: unknown };

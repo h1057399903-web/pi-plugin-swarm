@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import registerSwarmExtension, { countSwarmWorkers, renderSwarmTaskPrompt, resumeAgentIdsHint, resolveSwarmConcurrency, validateUniqueRenderedPrompts } from "../src/index.ts";
+import { SwarmAgentRuntime } from "../src/swarm-agent-runtime.ts";
 
 assert.equal(resolveSwarmConcurrency(1), 1);
 assert.equal(resolveSwarmConcurrency(8), 8);
@@ -58,4 +59,35 @@ await assert.rejects(
 );
 sessionStart({}, { sessionManager: { getBranch: () => [{ type: "custom", customType: "pi-swarm-state", data: { enabled: false } }] }, ui });
 assert.equal((await reloaded.toolDefs[0].execute("restored-off", { description: "x", items: ["x"] }, undefined, undefined, {})).isError, true);
+
+// Final tool output and persisted run state must use the redacted public question.
+const blockedPi = fakePi();
+registerSwarmExtension(blockedPi);
+await blockedPi.commandDefs[0].handler("on", { ui });
+const originalRun = SwarmAgentRuntime.prototype.run;
+const rawQuestion = "Need token=abc at C:\\private\\repo ".repeat(30);
+SwarmAgentRuntime.prototype.run = async (input) => ({
+  workerId: input.workerId, agentId: input.agentId, resumable: false, status: "blocked",
+  finishedAt: 2, durationMs: 1, turns: 1,
+  usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
+  output: "", profile: "coder", toolCalls: { report_blocked: 1 }, question: rawQuestion,
+});
+try {
+  const result = await blockedPi.toolDefs[0].execute("blocked", {
+    description: "blocked token=descsecret /private/description",
+    items: ["one token=itemsecret C:\\private\\item"],
+  }, undefined, undefined, {
+    cwd: process.cwd(),
+    sessionManager: { getSessionId: () => "owner", getSessionFile: () => undefined },
+  });
+  assert.match(result.content[0].text, /Question:/);
+  assert.doesNotMatch(result.content[0].text, /abc|itemsecret|C:\\private/);
+  const persistedRun = blockedPi.entries.at(-1).data;
+  assert.doesNotMatch(persistedRun.description, /descsecret|\/private\/description/);
+  assert.doesNotMatch(persistedRun.workers[0].item, /itemsecret|C:\\private/);
+  assert.doesNotMatch(persistedRun.workers[0].question, /abc|C:\\private/);
+  assert.ok(persistedRun.workers[0].question.length <= 500);
+} finally {
+  SwarmAgentRuntime.prototype.run = originalRun;
+}
 console.log("SWARM_RELOAD_REGISTRATION_OK");

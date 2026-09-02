@@ -54,9 +54,21 @@ The model can call the `swarm` tool with 1–128 bounded work packages. Default 
 
 - New tasks are rendered from their task prompt (or `prompt_template`/`promptTemplate` and `{{item}}`) before launch. Duplicate rendered prompts are rejected before any session is created; resume entries are intentionally excluded from this check.
 - `resume_agent_ids` maps an existing `agentId` to its follow-up prompt and launches those workers first. Resume requires a persisted parent session; `--no-session` workers are ephemeral and cannot resume or fork.
-- A rate-limited retry is reported as transient `suspended` telemetry while it waits for exponential backoff. If its retry budget is exhausted, the terminal status is `rate_limited`; progress includes attempts and reduced/recovered active capacity. Public integration snapshots/events expose only bounded status, identity, timing, model/profile metadata, and usage—not transcripts, paths, or credential values.
+- A rate-limited retry is reported as transient `suspended` telemetry while it waits for exponential backoff. If its retry budget is exhausted, the terminal status is `rate_limited`; progress includes attempts and reduced/recovered active capacity. Public integration snapshots/events expose only bounded status, identity, timing, model/profile, usage, and safe workspace-relative coordination metadata—not transcripts, absolute paths, or credential values.
 - Workers must not spawn or delegate to other workers. This extension has no nested swarm execution.
 - The coordinator receives a resume hint for unfinished resumable workers, in the form `resume_agent_ids: {"<agentId>": "..."}`.
+
+## v0.5 lightweight coordination
+
+v0.5 derives bounded progress from the existing Pi session events: per-worker tool-call counters, the current tool, the current safe target, and the last-activity timestamp. Public run/worker updates are coalesced; this adds no model calls. Counters and activity are observations, not a second execution channel.
+
+Edit/write tool events feed a run-scoped advisory overlap registry only. Targets are canonicalized and exposed only as bounded workspace-relative paths (up to 32 files per worker); it reports overlapping writers but does not lock, reserve, cancel, or change file ownership. `bash` side effects are deliberately not claimed by this registry. The registry is cleared with the run and is not a persistent coordination store.
+
+Workers also have the tiny `report_blocked` tool. It accepts only a bounded `question` (at most 500 characters), records a minimal blocked final status, and supplies a terminate hint so the session can stop without a separate coordination request. This is used instead of parsing transcripts and is not part of telemetry. A resumable blocked worker keeps the same owner-scoped `agentId` when resumed.
+
+The existing architecture remains the default `coder` profile and in-process Pi SDK `AgentSession` workers. There are no channels, feeds, inboxes, task databases, coordination memory, polling, watchers, child worker processes, persistent coordination stores, peer messaging, or filesystem sandbox. The workspace-relative boundary is a safety check, not a filesystem sandbox; tools run under the parent operating-system account.
+
+`./core` exposes the process-level public API with `apiVersion: 2`. The v2 fields are additive and optional for callers: safe profile, tool counters, current tool/target, last activity, touched/overlap files, and blocked question. Public snapshots/events redact transcripts, error text, credentials, absolute paths, and session paths.
 
 ## Runtime model
 
@@ -69,7 +81,7 @@ Inspired by Kimi Code's public MIT-licensed swarm scheduler:
 - active capacity shrinks on rate limits and recovers gradually;
 - batch cancellation propagates to running workers and waits for their cleanup;
 - stable task/result ordering;
-- token progress and aggregate UI updates are coalesced to avoid TUI flooding.
+- token progress, event-derived activity, and aggregate UI updates are coalesced to avoid TUI flooding;
 
 Unlike v0.1, workers do not start complete Pi CLI child processes. They use the official Pi SDK in the host process with:
 
@@ -79,14 +91,12 @@ Unlike v0.1, workers do not start complete Pi CLI child processes. They use the 
 - in-memory workers for `--no-session` parents;
 - dispose-after-run and reload-on-resume to keep memory bounded;
 - no extension recursion;
-- profile-bound tools: `explore` gets only `read`; `coder` gets `read`, `bash`, `edit`, and `write`;
+- profile-bound execution tools: `explore` gets `read`; `coder` gets `read`, `bash`, `edit`, and `write`; both profiles also get the bounded terminal-only `report_blocked` backhaul;
 - bounded public output and usage metadata.
 
 ## Live acceptance
 
-The v0.4 acceptance run used 16 real Luna workers. All 16 executed a tool and completed with exact outputs; measured peak concurrency was 16 and wall time was 23.56 seconds. A separate 16-worker abort run returned only after all 16 workers cleaned up (8.59 seconds). Persisted resume also retained the same agent ID and recalled the exact prior-turn value.
-
-These are optional networked acceptance tests rather than part of the offline unit suite.
+The v0.5 acceptance commands report wall time, peak concurrency, and event count (and the abort command also reports cleanup/status data). Results are intentionally not invented here: run `npm run test:live` in a trusted workspace to obtain the current provider-backed results. These are optional networked acceptance tests rather than part of the offline unit suite.
 
 ## Workbench integration
 
