@@ -1,13 +1,18 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
-import { SwarmAgentRuntime, MAX_OUTPUT_BYTES, isPathInside } from "../src/swarm-agent-runtime.ts";
+import { SwarmAgentRuntime, MAX_OUTPUT_BYTES, isPathInside, parseWorkerModel } from "../src/swarm-agent-runtime.ts";
 
 // Containment is deterministic for both path syntaxes and does not use lexical prefixes.
 assert.equal(isPathInside("/repo/work", "/repo"), true);
 assert.equal(isPathInside("/repo-other", "/repo"), false);
 assert.equal(isPathInside("C:\\repo\\work", "C:\\repo"), true);
 assert.equal(isPathInside("C:\\repo-other", "C:\\repo"), false);
+assert.deepEqual(parseWorkerModel("anthropic/claude-sonnet"), { provider: "anthropic", id: "claude-sonnet", value: "anthropic/claude-sonnet" });
+assert.deepEqual(parseWorkerModel("openrouter/anthropic/claude-sonnet"), { provider: "openrouter", id: "anthropic/claude-sonnet", value: "openrouter/anthropic/claude-sonnet" });
+assert.equal(parseWorkerModel("missing-provider"), undefined);
+assert.equal(parseWorkerModel("provider/has whitespace"), undefined);
+assert.equal(parseWorkerModel("provider/control\u0000character"), undefined);
 
 const model = {};
 const ownerDirectory = (owner) => join("/test-agent", "swarm", "sessions", createHash("sha256").update(owner).digest("hex").slice(0, 32));
@@ -59,6 +64,68 @@ function sessionFor(text, delay = 0) {
   const result = await r.run({ workerId: "one", prompt: "hello", cwd: "/tmp" });
   assert.equal(result.status, "completed"); assert.equal(result.output, "ok"); assert.equal(result.turns, 1);
   assert.equal(result.usage.input, 2); assert.equal(s.disposed, true);
+}
+
+// An explicit canonical model is resolved by provider/id and supplied to the worker session.
+{
+  const getModelCalls = []; let selectedModel;
+  const chosen = { provider: "anthropic", id: "claude-sonnet" };
+  const result = await new SwarmAgentRuntime(seams((options) => {
+    selectedModel = options.model;
+    return sessionFor("selected");
+  }, {
+    runtimeFactory: async () => ({
+      getModel(provider, id) {
+        getModelCalls.push([provider, id]);
+        return provider === chosen.provider && id === chosen.id ? chosen : undefined;
+      },
+    }),
+  })).run({ workerId: "selected-model", model: "anthropic/claude-sonnet", prompt: "x", cwd: "/tmp" });
+  assert.equal(result.status, "completed");
+  assert.deepEqual(getModelCalls, [["anthropic", "claude-sonnet"]]);
+  assert.equal(selectedModel, chosen);
+}
+
+// A host-registered provider and resolved model are bridged into the isolated worker runtime.
+{
+  const registrations = []; let selectedModel;
+  const chosen = { provider: "dynamic", id: "live-model", api: "custom" };
+  const providerConfig = { baseUrl: "http://localhost:1234", api: "openai-completions" };
+  const result = await new SwarmAgentRuntime(seams((options) => {
+    selectedModel = options.model;
+    return sessionFor("dynamic");
+  }, {
+    runtimeFactory: async () => ({
+      registerProvider(provider, config) { registrations.push([provider, config]); },
+      getModel: () => undefined,
+    }),
+  })).run({
+    workerId: "dynamic-model",
+    model: "dynamic/live-model",
+    modelDefinition: chosen,
+    providerRegistration: { config: providerConfig },
+    prompt: "x",
+    cwd: "/tmp",
+  });
+  assert.equal(result.status, "completed");
+  assert.deepEqual(registrations, [["dynamic", providerConfig]]);
+  assert.equal(selectedModel, chosen);
+}
+
+// Invalid and unavailable explicit models fail before a worker session is created.
+{
+  let sessions = 0;
+  const invalid = await new SwarmAgentRuntime(seams(() => { sessions++; return sessionFor("no"); })).run({
+    workerId: "invalid-model", model: "invalid", prompt: "x", cwd: "/tmp",
+  });
+  assert.equal(invalid.error, "Worker model is unavailable.");
+  assert.equal(sessions, 0);
+
+  const unavailable = await new SwarmAgentRuntime(seams(() => { sessions++; return sessionFor("no"); }, {
+    runtimeFactory: async () => ({ getModel: () => undefined }),
+  })).run({ workerId: "unavailable-model", model: "anthropic/missing", prompt: "x", cwd: "/tmp" });
+  assert.equal(unavailable.error, "Worker model is unavailable.");
+  assert.equal(sessions, 0);
 }
 
 // run completion waits for asynchronous session disposal.

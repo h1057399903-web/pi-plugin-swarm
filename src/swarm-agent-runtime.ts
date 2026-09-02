@@ -14,6 +14,16 @@ import { resolveWorkspaceTarget, type ResolvedWorkspaceTarget } from "./lightwei
 
 export const WORKER_MODEL = "openai-codex/gpt-5.6-luna";
 export const WORKER_THINKING_LEVEL = "medium" as const;
+export const MAX_WORKER_MODEL_LENGTH = 200;
+
+export interface WorkerModelReference { provider: string; id: string; value: string; }
+
+export function parseWorkerModel(value: unknown): WorkerModelReference | undefined {
+  if (typeof value !== "string" || value.length === 0 || value.length > MAX_WORKER_MODEL_LENGTH || value.trim() !== value || /[\s\u0000-\u001f\u007f]/.test(value)) return undefined;
+  const separator = value.indexOf("/");
+  if (separator <= 0 || separator === value.length - 1) return undefined;
+  return { provider: value.slice(0, separator), id: value.slice(separator + 1), value };
+}
 export const MAX_OUTPUT_BYTES = 50 * 1024;
 export const DEFAULT_PROGRESS_THROTTLE_MS = 250;
 export const MAX_QUESTION_LENGTH = 500;
@@ -30,8 +40,12 @@ const PROFILE_TOOLS: Record<WorkerProfile, string[]> = {
   explore: ["read"],
   coder: ["read", "bash", "edit", "write"],
 };
+export interface WorkerProviderRegistration { native?: unknown; config?: unknown; }
 export interface WorkerInput {
-  workerId: string; prompt: string; cwd: string; parentCwd?: string; item?: unknown; timeoutMs?: number;
+  workerId: string; prompt: string; cwd: string; parentCwd?: string; item?: unknown; timeoutMs?: number; model?: string;
+  /** Host-resolved model/provider data for providers registered dynamically in this Pi process. */
+  modelDefinition?: { provider?: unknown; id?: unknown };
+  providerRegistration?: WorkerProviderRegistration;
   profile?: WorkerProfile; subagentType?: WorkerProfile; subagent_type?: WorkerProfile; agentId?: string; ownerSessionId?: string; persist?: boolean; resume?: boolean; forkSessionFile?: string;
   /** Internal run-scoped sink. Targets are already canonical and workspace-relative. */
   onWriteTarget?: (target: ResolvedWorkspaceTarget) => void;
@@ -226,9 +240,20 @@ export class SwarmAgentRuntime {
           canonicalWorkerCwd = canonicalCwd;
         }
         state.controller.signal.throwIfAborted();
+        const workerModel = parseWorkerModel(input.model ?? WORKER_MODEL);
+        if (!workerModel) throw new Error("Worker model is unavailable.");
         const runtime = await this.runtime();
         state.controller.signal.throwIfAborted();
-        const model = runtime?.getModel?.("openai-codex", "gpt-5.6-luna") ?? runtime?.getModel?.(WORKER_MODEL);
+        const registration = input.providerRegistration;
+        if (registration?.native && typeof runtime?.registerNativeProvider === "function") {
+          runtime.registerNativeProvider(registration.native);
+        } else if (registration?.config && typeof runtime?.registerProvider === "function") {
+          runtime.registerProvider(workerModel.provider, registration.config);
+        }
+        const suppliedModel = input.modelDefinition;
+        const model = suppliedModel?.provider === workerModel.provider && suppliedModel.id === workerModel.id
+          ? suppliedModel
+          : runtime?.getModel?.(workerModel.provider, workerModel.id);
         if (!model) throw new Error("Worker model is unavailable.");
         const loader = this.seams.resourceLoaderFactory?.(workerCwd) ?? new DefaultResourceLoader({
           cwd: workerCwd, agentDir: getAgentDir(), noExtensions: true, noPromptTemplates: true, noThemes: true,

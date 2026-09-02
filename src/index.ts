@@ -4,7 +4,7 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { Text } from "@earendil-works/pi-tui";
 import { SwarmBatch, type SwarmTaskStatus } from "./features/swarm-batch.ts";
-import { SwarmAgentRuntime, WORKER_MODEL, WORKER_THINKING_LEVEL, type WorkerResult } from "./swarm-agent-runtime.ts";
+import { SwarmAgentRuntime, WORKER_MODEL, WORKER_THINKING_LEVEL, parseWorkerModel, type WorkerProviderRegistration, type WorkerResult } from "./swarm-agent-runtime.ts";
 import { getSwarmIntegration, type PublicSwarmRun, type PublicSwarmWorker } from "./public-api.ts";
 import { LightweightCoordination } from "./lightweight-coordination.ts";
 
@@ -17,6 +17,31 @@ const RUN_STATE_TYPE = "pi-swarm-run-v1";
 
 export type SwarmSubagentType = "explore" | "coder";
 interface SwarmTask { item: string; prompt?: string; cwd?: string; timeoutMs?: number; agentId?: string; resume?: boolean; subagent_type?: SwarmSubagentType; }
+interface ModelLike { provider?: unknown; id?: unknown; name?: unknown; }
+interface WorkerModelChoice { value: string; label: string; model: ModelLike; }
+interface WorkerModelContext {
+  scopedModels?: readonly { model?: ModelLike }[];
+  modelRegistry?: { getAvailable?: () => readonly ModelLike[] };
+}
+export interface SelectableWorkerModel { value: string; label: string; }
+
+function selectableWorkerModelChoices(context: WorkerModelContext): WorkerModelChoice[] {
+  const scoped = context.scopedModels ?? [];
+  const models = scoped.length > 0 ? scoped.map((entry) => entry.model) : context.modelRegistry?.getAvailable?.() ?? [];
+  const choices = new Map<string, WorkerModelChoice>();
+  for (const model of models) {
+    if (typeof model?.provider !== "string" || typeof model.id !== "string") continue;
+    const value = `${model.provider}/${model.id}`;
+    if (!parseWorkerModel(value) || choices.has(value)) continue;
+    const name = typeof model.name === "string" ? model.name.replace(/[\s\u0000-\u001f\u007f]+/g, " ").trim().slice(0, 100) : "";
+    choices.set(value, { value, label: name && name !== model.id && name !== value ? `${value} — ${name}` : value, model });
+  }
+  return [...choices.values()].sort((left, right) => left.value.localeCompare(right.value));
+}
+
+export function listSelectableWorkerModels(context: WorkerModelContext): SelectableWorkerModel[] {
+  return selectableWorkerModelChoices(context).map(({ value, label }) => ({ value, label }));
+}
 
 /** Guidance deliberately lives in the coordinator, rather than in user task text. */
 export const COORDINATOR_GUIDANCE = "Act as the swarm coordinator: split only genuinely independent, bounded work; assign non-overlapping ownership; inspect every result and verification signal; integrate the work yourself. Do not ask workers to spawn workers or delegate further.";
@@ -92,7 +117,7 @@ function publicStatus(status: SwarmTaskStatus): PublicSwarmWorker["status"] {
 
 interface InternalSwarmWorker extends PublicSwarmWorker { output?: string; error?: string; }
 
-function makeWorker(runId: string, task: SwarmTask, index: number, resumable: boolean): InternalSwarmWorker {
+function makeWorker(runId: string, task: SwarmTask, index: number, resumable: boolean, model: string): InternalSwarmWorker {
   return {
     workerId: `${runId}:${index + 1}`,
     agentId: task.agentId ?? randomUUID(),
@@ -107,7 +132,7 @@ function makeWorker(runId: string, task: SwarmTask, index: number, resumable: bo
     outputTokens: 0,
     cacheReadTokens: 0,
     cost: 0,
-    model: WORKER_MODEL,
+    model,
     thinking: WORKER_THINKING_LEVEL,
     toolCalls: {},
     touchedFiles: [],
@@ -119,31 +144,42 @@ export function registerSwarmExtension(pi: ExtensionAPI): void {
   const runtime = new SwarmAgentRuntime();
   const integration = getSwarmIntegration();
   let enabled = false;
-  const persist = () => pi.appendEntry(STATE_TYPE, { enabled });
+  let workerModel = WORKER_MODEL;
+  const persist = () => pi.appendEntry(STATE_TYPE, { enabled, workerModel });
   const applyEnabled = (next: boolean) => { enabled = next; integration.setEnabled(next); };
 
   pi.on("session_start", (_event, ctx) => {
     enabled = false;
+    workerModel = WORKER_MODEL;
     for (const entry of ctx.sessionManager.getBranch()) {
-      if (entry.type === "custom" && entry.customType === STATE_TYPE) enabled = Boolean((entry.data as { enabled?: unknown })?.enabled);
+      if (entry.type !== "custom" || entry.customType !== STATE_TYPE) continue;
+      const data = entry.data as { enabled?: unknown; workerModel?: unknown };
+      enabled = Boolean(data?.enabled);
+      const restoredModel = parseWorkerModel(data?.workerModel);
+      workerModel = restoredModel?.value ?? WORKER_MODEL;
     }
     integration.clearRuns();
     integration.setEnabled(enabled);
     ctx.ui.setStatus("swarm", enabled ? "🐝 swarm" : undefined);
+    const choices = listSelectableWorkerModels(ctx);
+    if (workerModel !== WORKER_MODEL && choices.length > 0 && !choices.some((choice) => choice.value === workerModel)) {
+      ctx.ui.notify(`Saved worker model ${workerModel} is not available in this Pi session. Choose another with /swarm model.`, "warning");
+    }
   });
 
   pi.on("before_agent_start", (event) => {
     if (!enabled) return;
-    return { systemPrompt: `${event.systemPrompt}\n\nSWARM MODE IS ACTIVE. ${COORDINATOR_GUIDANCE} Workers use Luna medium. Never delegate credentials, production mutation, deployments, service restarts, device installation, merges, or overlapping edits.` };
+    return { systemPrompt: `${event.systemPrompt}\n\nSWARM MODE IS ACTIVE. ${COORDINATOR_GUIDANCE} Workers use ${workerModel} at ${WORKER_THINKING_LEVEL}. Never delegate credentials, production mutation, deployments, service restarts, device installation, merges, or overlapping edits.` };
   });
 
   pi.registerCommand("swarm", {
-    description: "Toggle/start/cancel Pi Swarm: /swarm on|off|status|cancel <run-id>|<task>",
+    description: "Configure/start/cancel Pi Swarm: /swarm on|off|status|model|cancel <run-id>|<task>",
     getArgumentCompletions: (prefix) => {
       const commands = [
         { value: "on", label: "on", description: "Enable Swarm mode" },
         { value: "off", label: "off", description: "Disable Swarm mode" },
         { value: "status", label: "status", description: "Show Swarm status" },
+        { value: "model", label: "model", description: "Choose the worker model" },
         { value: "cancel ", label: "cancel <run-id>", description: "Cancel an active Swarm run" },
       ];
       const matches = commands.filter((command) => command.value.startsWith(prefix.toLowerCase()));
@@ -158,7 +194,31 @@ export function registerSwarmExtension(pi: ExtensionAPI): void {
       }
       if (lower === "status") {
         const active = integration.snapshot().runs.filter((run) => run.status === "running").length;
-        ctx.ui.notify(`Swarm ${enabled ? "ON" : "OFF"} · ${WORKER_MODEL} · ${WORKER_THINKING_LEVEL} · default adaptive up to ${MAX_CONCURRENCY} · max tasks ${MAX_TASKS} · active runs ${active}`, "info"); return;
+        ctx.ui.notify(`Swarm ${enabled ? "ON" : "OFF"} · ${workerModel} · ${WORKER_THINKING_LEVEL} · default adaptive up to ${MAX_CONCURRENCY} · max tasks ${MAX_TASKS} · active runs ${active}`, "info"); return;
+      }
+      if (lower === "model" || lower.startsWith("model ")) {
+        const choices = listSelectableWorkerModels(ctx);
+        let requested = args.slice("model".length).trim();
+        if (!requested) {
+          if (!ctx.hasUI) {
+            ctx.ui.notify("Specify a worker model as provider/model, or run /swarm model in interactive mode.", "warning"); return;
+          }
+          if (!choices.length) {
+            ctx.ui.notify("No worker models are available in this Pi session.", "warning"); return;
+          }
+          const selected = await ctx.ui.select(`Worker model (current: ${workerModel})`, choices.map((choice) => choice.label));
+          if (!selected) return;
+          requested = choices.find((choice) => choice.label === selected)?.value ?? "";
+        } else if (requested.toLowerCase() === "reset") {
+          requested = WORKER_MODEL;
+        }
+        const parsed = parseWorkerModel(requested);
+        if (!parsed || !choices.some((choice) => choice.value === parsed.value)) {
+          ctx.ui.notify(`Worker model ${requested || "(empty)"} is not available in this Pi session.`, "warning"); return;
+        }
+        workerModel = parsed.value;
+        persist();
+        ctx.ui.notify(`Swarm worker model set to ${workerModel}.`, "info"); return;
       }
       if (lower.startsWith("cancel ")) {
         const runId = args.slice(7).trim();
@@ -173,8 +233,8 @@ export function registerSwarmExtension(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "swarm",
     label: "Swarm",
-    description: `Launch or resume a Kimi-style bounded task swarm using in-process Pi AgentSessions. Supports 1-${MAX_TASKS} tasks, up to ${MAX_CONCURRENCY} active workers, stable resumable agent IDs, optional parent-context fork, initial burst ${INITIAL_LAUNCH_LIMIT}, then staggered launches. Workers always use ${WORKER_MODEL} at ${WORKER_THINKING_LEVEL}.`,
-    promptSnippet: "Delegate bounded independent packages to in-process Luna workers",
+    description: `Launch or resume a Kimi-style bounded task swarm using in-process Pi AgentSessions. Supports 1-${MAX_TASKS} tasks, up to ${MAX_CONCURRENCY} active workers, stable resumable agent IDs, optional parent-context fork, initial burst ${INITIAL_LAUNCH_LIMIT}, then staggered launches. Workers use the session-selected model (default ${WORKER_MODEL}) at ${WORKER_THINKING_LEVEL}.`,
+    promptSnippet: "Delegate bounded independent packages to in-process Pi workers",
     promptGuidelines: [
       "Use as many workers as are useful for independent packages with non-overlapping file ownership; use one only for a single or serial package.",
       "Use subagent_type explore for read-only investigation and coder only when the worker must run commands or modify files.",
@@ -198,6 +258,20 @@ export function registerSwarmExtension(pi: ExtensionAPI): void {
       const tasks = [...resumedTasks, ...newTasks];
       if (!tasks.length) throw new Error("Provide at least one task or resumeAgentIds entry");
       if (tasks.length > MAX_TASKS) throw new Error(`A swarm may contain at most ${MAX_TASKS} workers`);
+      const runWorkerModel = workerModel;
+      const choices = selectableWorkerModelChoices(ctx);
+      const canValidateModel = choices.length > 0 || typeof ctx.modelRegistry?.getAvailable === "function" || (ctx.scopedModels?.length ?? 0) > 0;
+      const modelChoice = choices.find((choice) => choice.value === runWorkerModel);
+      if (canValidateModel && !modelChoice) {
+        throw new Error(`Selected worker model ${runWorkerModel} is not available in this Pi session. Choose another with /swarm model.`);
+      }
+      const parsedWorkerModel = parseWorkerModel(runWorkerModel);
+      if (!parsedWorkerModel) throw new Error("Selected worker model is invalid. Choose another with /swarm model.");
+      const nativeProvider = ctx.modelRegistry?.getRegisteredNativeProvider?.(parsedWorkerModel.provider);
+      const providerConfig = nativeProvider ? undefined : ctx.modelRegistry?.getRegisteredProviderConfig?.(parsedWorkerModel.provider);
+      let providerRegistration: WorkerProviderRegistration | undefined;
+      if (nativeProvider) providerRegistration = { native: nativeProvider };
+      else if (providerConfig) providerRegistration = { config: providerConfig };
       const ownerSessionId = ctx.sessionManager.getSessionId();
       const parentSessionFile = ctx.sessionManager.getSessionFile();
       const resumable = Boolean(parentSessionFile);
@@ -207,7 +281,7 @@ export function registerSwarmExtension(pi: ExtensionAPI): void {
       const requestedConcurrency = resolveSwarmConcurrency(tasks.length, params.concurrency);
       const runId = randomUUID();
       const workers = tasks.map((task, index) => {
-        const worker = makeWorker(runId, task, index, resumable);
+        const worker = makeWorker(runId, task, index, resumable, runWorkerModel);
         if (!task.resume) worker.profile = task.subagent_type ?? "coder";
         return worker;
       });
@@ -257,6 +331,9 @@ export function registerSwarmExtension(pi: ExtensionAPI): void {
             cwd: task.cwd ?? ctx.cwd,
             item: task.item,
             timeoutMs: task.timeoutMs,
+            model: runWorkerModel,
+            modelDefinition: modelChoice?.model,
+            providerRegistration,
             profile: task.resume ? undefined : task.subagent_type ?? "coder",
             onWriteTarget: (target) => {
               const update = coordination.recordWrite(worker.workerId, target);
@@ -352,7 +429,7 @@ export function registerSwarmExtension(pi: ExtensionAPI): void {
         text += `\n  ${icon} ${worker.item}${status === "suspended" ? " (suspended)" : ""}`;
         if (worker.turns) text += theme.fg("dim", ` · ${worker.turns} turns · ↓${worker.outputTokens}`);
       }
-      text += theme.fg("dim", `\n${WORKER_MODEL} · ${WORKER_THINKING_LEVEL} · capacity ${run.activeCapacity}/${run.requestedConcurrency}`);
+      text += theme.fg("dim", `\n${run.workers[0]?.model ?? WORKER_MODEL} · ${WORKER_THINKING_LEVEL} · capacity ${run.activeCapacity}/${run.requestedConcurrency}`);
       const hint = resumeAgentIdsHint(run.workers);
       if (hint) text += theme.fg("dim", `\n${hint}`);
       return new Text(text, 0, 0);

@@ -2,7 +2,7 @@
 
 English | [简体中文](README.zh-CN.md)
 
-A standalone, MIT-licensed Pi extension for coordinator-driven parallel work. It uses in-process Pi `AgentSession` workers fixed to `openai-codex/gpt-5.6-luna` with `medium` thinking, including 16-way concurrency, stable agent IDs, follow-up resume, and optional parent-context fork.
+A standalone, MIT-licensed Pi extension for coordinator-driven parallel work. It uses in-process Pi `AgentSession` workers with a session-selectable model (default `openai-codex/gpt-5.6-luna`) and `medium` thinking, including 16-way concurrency, stable agent IDs, follow-up resume, and optional parent-context fork.
 
 ## Install
 
@@ -31,7 +31,7 @@ Then restart Pi or run `/reload`. Git-installed packages do not currently update
 ## Requirements and usage notes
 
 - Node.js 22.19 or newer and Pi 0.84.4 are required; this package does not promise compatibility with other Pi SDK versions.
-- Workers are fixed to `openai-codex/gpt-5.6-luna` with `medium` thinking. Your normal Pi credential store must have access to that model; this package does not include or manage credentials.
+- Workers default to `openai-codex/gpt-5.6-luna` with `medium` thinking. `/swarm model` can select any model available to the current Pi session; this package does not include or manage credentials, and selecting a model does not grant access to it.
 - A delegated worker `cwd` must resolve inside the parent Pi working directory; relative, absolute, and symlinked escapes are rejected before worker startup. This is a working-directory boundary, not a filesystem sandbox: worker tools still run under the same operating-system account and may accept absolute paths.
 - Install and run the package only in trusted workspaces, and review worker changes before accepting them.
 - `npm run check` uses offline unit and packaging tests and does not call a model. `npm run test:live` is the explicit networked acceptance aggregate; it makes real model calls and consumes provider quota.
@@ -44,11 +44,16 @@ No npm publication or GitHub Release is required. Installing directly from this 
 /swarm on
 /swarm off
 /swarm status
+/swarm model
+/swarm model <provider/model>
+/swarm model reset
 /swarm cancel <run-id>
 /swarm <task>
 ```
 
-The model can call the `swarm` tool with 1–128 bounded work packages. Default concurrency is adaptive (`min(total workers, 16)`); callers may request a lower or explicit limit up to 16. Every worker is fixed to Luna (`openai-codex/gpt-5.6-luna`) with `medium` thinking. Profiles are enforced runtime capabilities: `explore` receives only `read`, while `coder` receives `read`, `bash`, `edit`, and `write`; `coder` is the backward-compatible default. Completed workers return a stable owner-scoped `agentId` and can be resumed with `resume_agent_ids`; a resumed worker keeps that identity and cannot be silently replaced by a new worker. New workers can set `fork: true` when every task genuinely requires the completed parent conversation. Resume and fork cannot be combined. Set `subagent_type: "explore"` for repository investigation and read-only analysis, or `subagent_type: "coder"` for implementation and verification. They use the same model but different enforced tool permissions; an `explore` session cannot be escalated to `coder` when resumed.
+`/swarm model` opens a sorted picker populated from the current session's scoped models, or from all available models when no model scope is configured. An explicit `provider/model` must be in that same catalog; arbitrary model strings are rejected. The choice is branch-aware session state, survives reload/resume through the Pi session log, and is snapshotted when each swarm run starts. `reset` selects the default Luna model when it is available. If a saved choice is no longer available, Swarm warns instead of silently switching to a different model.
+
+The model can call the `swarm` tool with 1–128 bounded work packages. Default concurrency is adaptive (`min(total workers, 16)`); callers may request a lower or explicit limit up to 16. Every worker in a run uses the selected model with `medium` thinking. Profiles are enforced runtime capabilities: `explore` receives only `read`, while `coder` receives `read`, `bash`, `edit`, and `write`; `coder` is the backward-compatible default. Completed workers return a stable owner-scoped `agentId` and can be resumed with `resume_agent_ids`; a resumed worker keeps that identity and cannot be silently replaced by a new worker. New workers can set `fork: true` when every task genuinely requires the completed parent conversation. Resume and fork cannot be combined. Set `subagent_type: "explore"` for repository investigation and read-only analysis, or `subagent_type: "coder"` for implementation and verification. Workers in the same run use the same snapshotted model but different enforced tool permissions; an `explore` session cannot be escalated to `coder` when resumed.
 
 ## Task validation and lifecycle
 

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import registerSwarmExtension, { countSwarmWorkers, renderSwarmTaskPrompt, resumeAgentIdsHint, resolveSwarmConcurrency, validateUniqueRenderedPrompts } from "../src/index.ts";
+import registerSwarmExtension, { countSwarmWorkers, listSelectableWorkerModels, renderSwarmTaskPrompt, resumeAgentIdsHint, resolveSwarmConcurrency, validateUniqueRenderedPrompts } from "../src/index.ts";
 import { SwarmAgentRuntime } from "../src/swarm-agent-runtime.ts";
 
 assert.equal(resolveSwarmConcurrency(1), 1);
@@ -13,6 +13,21 @@ assert.deepEqual(validateUniqueRenderedPrompts([{ item: "a" }, { item: "b" }], "
 assert.throws(() => validateUniqueRenderedPrompts([{ item: "a" }, { item: "a" }], "Inspect {{item}}"), /Duplicate rendered prompt/);
 assert.equal(resumeAgentIdsHint([{ agentId: "done", item: "a", status: "completed", resumable: true }]), "");
 assert.match(resumeAgentIdsHint([{ agentId: "open", item: "b", status: "aborted", resumable: true }]), /resume_agent_ids/);
+assert.deepEqual(listSelectableWorkerModels({
+  scopedModels: [],
+  modelRegistry: { getAvailable: () => [
+    { provider: "openai-codex", id: "gpt-5.6-luna", name: "Luna" },
+    { provider: "anthropic", id: "claude-sonnet", name: "Claude Sonnet" },
+    { provider: "anthropic", id: "claude-sonnet", name: "duplicate" },
+  ] },
+}), [
+  { value: "anthropic/claude-sonnet", label: "anthropic/claude-sonnet — Claude Sonnet" },
+  { value: "openai-codex/gpt-5.6-luna", label: "openai-codex/gpt-5.6-luna — Luna" },
+]);
+assert.deepEqual(listSelectableWorkerModels({
+  scopedModels: [{ model: { provider: "scoped", id: "only", name: "Scoped Only" } }],
+  modelRegistry: { getAvailable: () => [{ provider: "ignored", id: "model" }] },
+}), [{ value: "scoped/only", label: "scoped/only — Scoped Only" }]);
 
 function fakePi() {
   const handlers = new Map(); const commands = []; const commandDefs = []; const tools = []; const toolDefs = []; const entries = [];
@@ -25,6 +40,27 @@ function fakePi() {
   };
 }
 const ui = { setStatus() {}, notify() {} };
+function fakeCommandContext({ available = [], scopedModels = [], choice, hasUI = true } = {}) {
+  const notifications = []; const selections = [];
+  return {
+    hasUI,
+    scopedModels,
+    modelRegistry: {
+      getAvailable: () => available,
+      getRegisteredNativeProvider: () => undefined,
+      getRegisteredProviderConfig: () => undefined,
+    },
+    sessionManager: { getSessionId: () => "owner", getSessionFile: () => undefined },
+    cwd: process.cwd(),
+    notifications,
+    selections,
+    ui: {
+      setStatus() {},
+      notify(message, level) { notifications.push({ message, level }); },
+      async select(title, options) { selections.push({ title, options }); return choice; },
+    },
+  };
+}
 
 const first = fakePi();
 registerSwarmExtension(first);
@@ -36,6 +72,7 @@ assert.deepEqual(
     { value: "on", label: "on", description: "Enable Swarm mode" },
     { value: "off", label: "off", description: "Disable Swarm mode" },
     { value: "status", label: "status", description: "Show Swarm status" },
+    { value: "model", label: "model", description: "Choose the worker model" },
     { value: "cancel ", label: "cancel <run-id>", description: "Cancel an active Swarm run" },
   ],
 );
@@ -44,6 +81,9 @@ assert.deepEqual(first.commandDefs[0].getArgumentCompletions("st"), [
 ]);
 assert.deepEqual(first.commandDefs[0].getArgumentCompletions("ST"), [
   { value: "status", label: "status", description: "Show Swarm status" },
+]);
+assert.deepEqual(first.commandDefs[0].getArgumentCompletions("mo"), [
+  { value: "model", label: "model", description: "Choose the worker model" },
 ]);
 assert.equal(first.commandDefs[0].getArgumentCompletions("unknown"), null);
 const disabled = await first.toolDefs[0].execute("disabled", { description: "must not start", items: ["x"] }, undefined, undefined, {});
@@ -62,18 +102,85 @@ await assert.rejects(
 await first.commandDefs[0].handler("off", { ui });
 assert.equal((await first.toolDefs[0].execute("disabled-again", { description: "x", items: ["x"] }, undefined, undefined, {})).isError, true);
 
-// Pi owns extension lifecycle and restores the persisted gate on reload.
+// Worker model selection is catalog-backed, picker-driven, and session-persisted.
+const selectable = fakePi();
+registerSwarmExtension(selectable);
+const availableModels = [
+  { provider: "openai-codex", id: "gpt-5.6-luna", name: "Luna" },
+  { provider: "anthropic", id: "claude-sonnet", name: "Claude Sonnet" },
+];
+const pickerContext = fakeCommandContext({
+  available: availableModels,
+  choice: "anthropic/claude-sonnet — Claude Sonnet",
+});
+const selectedProviderConfig = { baseUrl: "https://example.invalid", api: "anthropic-messages" };
+pickerContext.modelRegistry.getRegisteredProviderConfig = (provider) => provider === "anthropic" ? selectedProviderConfig : undefined;
+await selectable.commandDefs[0].handler("model", pickerContext);
+assert.deepEqual(pickerContext.selections[0].options, [
+  "anthropic/claude-sonnet — Claude Sonnet",
+  "openai-codex/gpt-5.6-luna — Luna",
+]);
+assert.deepEqual(selectable.entries.at(-1), {
+  type: "pi-swarm-state",
+  data: { enabled: false, workerModel: "anthropic/claude-sonnet" },
+});
+assert.match(pickerContext.notifications.at(-1).message, /anthropic\/claude-sonnet/);
+
+const rejectedContext = fakeCommandContext({ available: availableModels });
+await selectable.commandDefs[0].handler("model unknown/model", rejectedContext);
+assert.equal(selectable.entries.length, 1);
+assert.equal(rejectedContext.notifications.at(-1).level, "warning");
+
+const noUiContext = fakeCommandContext({ available: availableModels, hasUI: false });
+await selectable.commandDefs[0].handler("model", noUiContext);
+assert.equal(noUiContext.selections.length, 0);
+assert.match(noUiContext.notifications.at(-1).message, /provider\/model/);
+
+// Each run snapshots the selected model and passes it to every worker.
+await selectable.commandDefs[0].handler("on", pickerContext);
+const selectedInputs = [];
+const originalSelectableRun = SwarmAgentRuntime.prototype.run;
+SwarmAgentRuntime.prototype.run = async (input) => {
+  selectedInputs.push(input);
+  return {
+    workerId: input.workerId, agentId: input.agentId, resumable: false, status: "completed",
+    finishedAt: 2, durationMs: 1, turns: 1,
+    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
+    output: "ok", profile: "coder", toolCalls: {},
+  };
+};
+try {
+  const result = await selectable.toolDefs[0].execute("selected", {
+    description: "selected model",
+    items: ["one", "two"],
+  }, undefined, undefined, pickerContext);
+  assert.deepEqual(selectedInputs.map((input) => input.model), ["anthropic/claude-sonnet", "anthropic/claude-sonnet"]);
+  assert.ok(selectedInputs.every((input) => input.modelDefinition === availableModels[1]));
+  assert.ok(selectedInputs.every((input) => input.providerRegistration.config === selectedProviderConfig));
+  assert.deepEqual(result.details.workers.map((worker) => worker.model), ["anthropic/claude-sonnet", "anthropic/claude-sonnet"]);
+
+  pickerContext.modelRegistry.getAvailable = () => [availableModels[0]];
+  await assert.rejects(
+    selectable.toolDefs[0].execute("stale-selected", { description: "stale", items: ["one"] }, undefined, undefined, pickerContext),
+    /not available in this Pi session/,
+  );
+  assert.equal(selectedInputs.length, 2, "an unavailable saved model must fail before worker creation");
+} finally {
+  SwarmAgentRuntime.prototype.run = originalSelectableRun;
+}
+
+// Pi owns extension lifecycle and restores the persisted gate and model on reload.
 const reloaded = fakePi();
 registerSwarmExtension(reloaded);
 assert.deepEqual(reloaded.commands, ["swarm"]);
 assert.deepEqual(reloaded.tools, ["swarm"]);
 const sessionStart = reloaded.handlers.get("session_start")[0];
-sessionStart({}, { sessionManager: { getBranch: () => [{ type: "custom", customType: "pi-swarm-state", data: { enabled: true } }] }, ui });
+sessionStart({}, { sessionManager: { getBranch: () => [{ type: "custom", customType: "pi-swarm-state", data: { enabled: true, workerModel: "anthropic/claude-sonnet" } }] }, ui, scopedModels: [], modelRegistry: { getAvailable: () => availableModels } });
 await assert.rejects(
   reloaded.toolDefs[0].execute("restored", { description: "duplicates", items: ["same", "same"] }, undefined, undefined, {}),
   /Duplicate rendered prompt/,
 );
-sessionStart({}, { sessionManager: { getBranch: () => [{ type: "custom", customType: "pi-swarm-state", data: { enabled: false } }] }, ui });
+sessionStart({}, { sessionManager: { getBranch: () => [{ type: "custom", customType: "pi-swarm-state", data: { enabled: false } }] }, ui, scopedModels: [], modelRegistry: { getAvailable: () => availableModels } });
 assert.equal((await reloaded.toolDefs[0].execute("restored-off", { description: "x", items: ["x"] }, undefined, undefined, {})).isError, true);
 
 // Final tool output and persisted run state must use the redacted public question.

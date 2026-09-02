@@ -2,7 +2,7 @@
 
 [English](README.md) | 简体中文
 
-一个独立、MIT 授权的 Pi 扩展，用于由主模型协调的并行工作。它通过进程内 Pi `AgentSession` 运行固定为 `openai-codex/gpt-5.6-luna`、thinking `medium` 的 worker，支持最高 16 路并发、稳定 Agent ID、后续恢复和可选的父会话上下文 fork。
+一个独立、MIT 授权的 Pi 扩展，用于由主模型协调的并行工作。它通过进程内 Pi `AgentSession` 运行模型可按会话选择（默认 `openai-codex/gpt-5.6-luna`）、thinking 固定为 `medium` 的 worker，支持最高 16 路并发、稳定 Agent ID、后续恢复和可选的父会话上下文 fork。
 
 ## 安装
 
@@ -31,7 +31,7 @@ pi update --extensions
 ## 要求与使用提醒
 
 - 需要 Node.js 22.19 或更新版本及 Pi 0.84.4；本包不承诺兼容其他 Pi SDK 版本。
-- Worker 固定使用 `openai-codex/gpt-5.6-luna` 和 `medium` thinking。你的常规 Pi credential store 必须有权访问该模型；本扩展不包含也不管理凭证。
+- Worker 默认使用 `openai-codex/gpt-5.6-luna` 和 `medium` thinking。可通过 `/swarm model` 选择当前 Pi 会话可用的任一模型；本扩展不包含也不管理凭证，选择模型也不会授予访问权限。
 - 委派给 worker 的 `cwd` 必须解析在父 Pi 工作目录内；相对路径、绝对路径和符号链接越界会在 worker 启动前被拒绝。这只是工作目录边界，不是文件系统沙箱：worker 工具仍以相同操作系统账户运行，并可能接受绝对路径。
 - 请只在可信工作区安装和运行，并在接受结果前审查 worker 的修改。
 - `npm run check` 只执行离线单元测试和打包测试，不会调用模型；`npm run test:live` 是显式的联网验收聚合脚本，会真实调用模型并消耗 Provider 配额。
@@ -44,11 +44,16 @@ pi update --extensions
 /swarm on
 /swarm off
 /swarm status
+/swarm model
+/swarm model <provider/model>
+/swarm model reset
 /swarm cancel <run-id>
 /swarm <任务>
 ```
 
-主模型可以调用 `swarm` 工具，提交 1–128 个边界清楚的工作包。默认并发会自适应为 `min(worker 总数, 16)`；调用方也可以指定不超过 16 的更低或明确并发值。每个 worker 固定使用 Luna（`openai-codex/gpt-5.6-luna`）和 `medium` thinking。Profile 是运行时强制权限：`explore` 只有 `read`，`coder` 才有 `read`、`bash`、`edit` 和 `write`；为保持兼容，默认是 `coder`。完成的 worker 会返回稳定且按 owner 隔离的 `agentId`，可通过 `resume_agent_ids` 继续；恢复会保留该身份，不会静默替换成新 worker。只有当每个新 worker 都确实需要完整父会话上下文时，才应设置 `fork: true`；resume 与 fork 不能同时使用。仓库调查和只读分析可设置 `subagent_type: "explore"`；实现和验证可设置 `subagent_type: "coder"`。它们使用相同模型，但工具权限由运行时硬性区分；已有 `explore` Session 恢复时不能升级成 `coder`。
+`/swarm model` 会打开排序后的模型选择列表：当前会话配置了模型 scope 时使用 scoped models，否则列出全部可用模型。直接指定的 `provider/model` 也必须存在于同一列表，任意模型字符串会被拒绝。选择结果属于分支感知的会话状态，会通过 Pi Session 日志在 reload/resume 后恢复，并在每次 swarm run 开始时固定快照。默认 Luna 可用时，`reset` 会恢复该默认值。已保存的模型如果不再可用，Swarm 会警告，而不会静默切换到其他模型。
+
+主模型可以调用 `swarm` 工具，提交 1–128 个边界清楚的工作包。默认并发会自适应为 `min(worker 总数, 16)`；调用方也可以指定不超过 16 的更低或明确并发值。一次 run 内的所有 worker 使用已选择的模型和 `medium` thinking。Profile 是运行时强制权限：`explore` 只有 `read`，`coder` 才有 `read`、`bash`、`edit` 和 `write`；为保持兼容，默认是 `coder`。完成的 worker 会返回稳定且按 owner 隔离的 `agentId`，可通过 `resume_agent_ids` 继续；恢复会保留该身份，不会静默替换成新 worker。只有当每个新 worker 都确实需要完整父会话上下文时，才应设置 `fork: true`；resume 与 fork 不能同时使用。仓库调查和只读分析可设置 `subagent_type: "explore"`；实现和验证可设置 `subagent_type: "coder"`。同一 run 的 worker 使用相同的模型快照，但工具权限由运行时硬性区分；已有 `explore` Session 恢复时不能升级成 `coder`。
 
 ## 任务校验与生命周期
 
