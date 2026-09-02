@@ -14,20 +14,23 @@ assert.throws(() => validateUniqueRenderedPrompts([{ item: "a" }, { item: "a" }]
 assert.equal(resumeAgentIdsHint([{ agentId: "done", item: "a", status: "completed", resumable: true }]), "");
 assert.match(resumeAgentIdsHint([{ agentId: "open", item: "b", status: "aborted", resumable: true }]), /resume_agent_ids/);
 assert.deepEqual(listSelectableWorkerModels({
+  model: { provider: "openai-codex", id: "gpt-5.6-sol", name: "Sol" },
   scopedModels: [],
   modelRegistry: { getAvailable: () => [
     { provider: "openai-codex", id: "gpt-5.6-luna", name: "Luna" },
     { provider: "anthropic", id: "claude-sonnet", name: "Claude Sonnet" },
+    { provider: "openai-codex", id: "gpt-5.6-sol", name: "Sol" },
     { provider: "anthropic", id: "claude-sonnet", name: "duplicate" },
   ] },
-}), [
-  { value: "anthropic/claude-sonnet", label: "anthropic/claude-sonnet — Claude Sonnet" },
-  { value: "openai-codex/gpt-5.6-luna", label: "openai-codex/gpt-5.6-luna — Luna" },
+}, "openai-codex/gpt-5.6-luna"), [
+  { value: "openai-codex/gpt-5.6-sol", label: "gpt-5.6-sol [openai-codex] — Sol ✓" },
+  { value: "openai-codex/gpt-5.6-luna", label: "gpt-5.6-luna [openai-codex] — Luna · swarm current" },
+  { value: "anthropic/claude-sonnet", label: "claude-sonnet [anthropic] — Claude Sonnet" },
 ]);
 assert.deepEqual(listSelectableWorkerModels({
   scopedModels: [{ model: { provider: "scoped", id: "only", name: "Scoped Only" } }],
   modelRegistry: { getAvailable: () => [{ provider: "ignored", id: "model" }] },
-}), [{ value: "scoped/only", label: "scoped/only — Scoped Only" }]);
+}), [{ value: "scoped/only", label: "only [scoped] — Scoped Only" }]);
 
 function fakePi() {
   const handlers = new Map(); const commands = []; const commandDefs = []; const tools = []; const toolDefs = []; const entries = [];
@@ -40,10 +43,11 @@ function fakePi() {
   };
 }
 const ui = { setStatus() {}, notify() {} };
-function fakeCommandContext({ available = [], scopedModels = [], choice, hasUI = true } = {}) {
+function fakeCommandContext({ available = [], scopedModels = [], model, choice, hasUI = true } = {}) {
   const notifications = []; const selections = [];
   return {
     hasUI,
+    model,
     scopedModels,
     modelRegistry: {
       getAvailable: () => available,
@@ -108,17 +112,20 @@ registerSwarmExtension(selectable);
 const availableModels = [
   { provider: "openai-codex", id: "gpt-5.6-luna", name: "Luna" },
   { provider: "anthropic", id: "claude-sonnet", name: "Claude Sonnet" },
+  { provider: "openai-codex", id: "gpt-5.6-sol", name: "Sol" },
 ];
 const pickerContext = fakeCommandContext({
   available: availableModels,
-  choice: "anthropic/claude-sonnet — Claude Sonnet",
+  model: availableModels[2],
+  choice: "claude-sonnet [anthropic] — Claude Sonnet",
 });
 const selectedProviderConfig = { baseUrl: "https://example.invalid", api: "anthropic-messages" };
 pickerContext.modelRegistry.getRegisteredProviderConfig = (provider) => provider === "anthropic" ? selectedProviderConfig : undefined;
 await selectable.commandDefs[0].handler("model", pickerContext);
 assert.deepEqual(pickerContext.selections[0].options, [
-  "anthropic/claude-sonnet — Claude Sonnet",
-  "openai-codex/gpt-5.6-luna — Luna",
+  "gpt-5.6-sol [openai-codex] — Sol ✓",
+  "gpt-5.6-luna [openai-codex] — Luna · swarm current",
+  "claude-sonnet [anthropic] — Claude Sonnet",
 ]);
 assert.deepEqual(selectable.entries.at(-1), {
   type: "pi-swarm-state",

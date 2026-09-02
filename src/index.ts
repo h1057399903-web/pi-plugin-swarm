@@ -20,27 +20,44 @@ interface SwarmTask { item: string; prompt?: string; cwd?: string; timeoutMs?: n
 interface ModelLike { provider?: unknown; id?: unknown; name?: unknown; }
 interface WorkerModelChoice { value: string; label: string; model: ModelLike; }
 interface WorkerModelContext {
+  model?: ModelLike;
   scopedModels?: readonly { model?: ModelLike }[];
   modelRegistry?: { getAvailable?: () => readonly ModelLike[] };
 }
 export interface SelectableWorkerModel { value: string; label: string; }
 
-function selectableWorkerModelChoices(context: WorkerModelContext): WorkerModelChoice[] {
-  const scoped = context.scopedModels ?? [];
-  const models = scoped.length > 0 ? scoped.map((entry) => entry.model) : context.modelRegistry?.getAvailable?.() ?? [];
-  const choices = new Map<string, WorkerModelChoice>();
-  for (const model of models) {
-    if (typeof model?.provider !== "string" || typeof model.id !== "string") continue;
-    const value = `${model.provider}/${model.id}`;
-    if (!parseWorkerModel(value) || choices.has(value)) continue;
-    const name = typeof model.name === "string" ? model.name.replace(/[\s\u0000-\u001f\u007f]+/g, " ").trim().slice(0, 100) : "";
-    choices.set(value, { value, label: name && name !== model.id && name !== value ? `${value} — ${name}` : value, model });
-  }
-  return [...choices.values()].sort((left, right) => left.value.localeCompare(right.value));
+function modelValue(model: ModelLike | undefined): string | undefined {
+  if (typeof model?.provider !== "string" || typeof model.id !== "string") return undefined;
+  const value = `${model.provider}/${model.id}`;
+  return parseWorkerModel(value)?.value;
 }
 
-export function listSelectableWorkerModels(context: WorkerModelContext): SelectableWorkerModel[] {
-  return selectableWorkerModelChoices(context).map(({ value, label }) => ({ value, label }));
+function selectableWorkerModelChoices(context: WorkerModelContext, currentWorkerModel?: string): WorkerModelChoice[] {
+  const scoped = context.scopedModels ?? [];
+  const models = scoped.length > 0 ? scoped.map((entry) => entry.model) : context.modelRegistry?.getAvailable?.() ?? [];
+  const parentModel = modelValue(context.model);
+  const choices = new Map<string, WorkerModelChoice>();
+  for (const model of models) {
+    if (!model) continue;
+    const value = modelValue(model);
+    if (!value || choices.has(value)) continue;
+    const provider = model.provider as string;
+    const id = model.id as string;
+    const name = typeof model.name === "string" ? model.name.replace(/[\s\u0000-\u001f\u007f]+/g, " ").trim().slice(0, 100) : "";
+    const detail = name && name !== id && name !== value ? ` — ${name}` : "";
+    const badges = `${value === parentModel ? " ✓" : ""}${value === currentWorkerModel ? " · swarm current" : ""}`;
+    choices.set(value, { value, label: `${id} [${provider}]${detail}${badges}`, model });
+  }
+  const rank = (choice: WorkerModelChoice) => choice.value === parentModel ? 0 : choice.value === currentWorkerModel ? 1 : 2;
+  return [...choices.values()].sort((left, right) =>
+    rank(left) - rank(right) ||
+    String(left.model.provider).localeCompare(String(right.model.provider)) ||
+    String(left.model.id).localeCompare(String(right.model.id))
+  );
+}
+
+export function listSelectableWorkerModels(context: WorkerModelContext, currentWorkerModel?: string): SelectableWorkerModel[] {
+  return selectableWorkerModelChoices(context, currentWorkerModel).map(({ value, label }) => ({ value, label }));
 }
 
 /** Guidance deliberately lives in the coordinator, rather than in user task text. */
@@ -161,7 +178,7 @@ export function registerSwarmExtension(pi: ExtensionAPI): void {
     integration.clearRuns();
     integration.setEnabled(enabled);
     ctx.ui.setStatus("swarm", enabled ? "🐝 swarm" : undefined);
-    const choices = listSelectableWorkerModels(ctx);
+    const choices = listSelectableWorkerModels(ctx, workerModel);
     if (workerModel !== WORKER_MODEL && choices.length > 0 && !choices.some((choice) => choice.value === workerModel)) {
       ctx.ui.notify(`Saved worker model ${workerModel} is not available in this Pi session. Choose another with /swarm model.`, "warning");
     }
@@ -197,7 +214,7 @@ export function registerSwarmExtension(pi: ExtensionAPI): void {
         ctx.ui.notify(`Swarm ${enabled ? "ON" : "OFF"} · ${workerModel} · ${WORKER_THINKING_LEVEL} · default adaptive up to ${MAX_CONCURRENCY} · max tasks ${MAX_TASKS} · active runs ${active}`, "info"); return;
       }
       if (lower === "model" || lower.startsWith("model ")) {
-        const choices = listSelectableWorkerModels(ctx);
+        const choices = listSelectableWorkerModels(ctx, workerModel);
         let requested = args.slice("model".length).trim();
         if (!requested) {
           if (!ctx.hasUI) {
@@ -259,7 +276,7 @@ export function registerSwarmExtension(pi: ExtensionAPI): void {
       if (!tasks.length) throw new Error("Provide at least one task or resumeAgentIds entry");
       if (tasks.length > MAX_TASKS) throw new Error(`A swarm may contain at most ${MAX_TASKS} workers`);
       const runWorkerModel = workerModel;
-      const choices = selectableWorkerModelChoices(ctx);
+      const choices = selectableWorkerModelChoices(ctx, runWorkerModel);
       const canValidateModel = choices.length > 0 || typeof ctx.modelRegistry?.getAvailable === "function" || (ctx.scopedModels?.length ?? 0) > 0;
       const modelChoice = choices.find((choice) => choice.value === runWorkerModel);
       if (canValidateModel && !modelChoice) {

@@ -51,7 +51,7 @@ pi update --extensions
 /swarm <任务>
 ```
 
-`/swarm model` 会打开排序后的模型选择列表：当前会话配置了模型 scope 时使用 scoped models，否则列出全部可用模型。直接指定的 `provider/model` 也必须存在于同一列表，任意模型字符串会被拒绝。选择结果属于分支感知的会话状态，会通过 Pi Session 日志在 reload/resume 后恢复，并在每次 swarm run 开始时固定快照。默认 Luna 可用时，`reset` 会恢复该默认值。已保存的模型如果不再可用，Swarm 会警告，而不会静默切换到其他模型。
+`/swarm model` 使用与 Pi `/model` 相同的模型目录：当前会话配置了模型 scope 时使用 scoped models，否则列出全部可用模型。父会话当前模型排在第一位，Swarm 当前模型排在其后，其余条目再按 provider/model 排序。直接指定的 `provider/model` 也必须存在于同一列表，任意模型字符串会被拒绝。选择结果属于分支感知的会话状态，会通过 Pi Session 日志在 reload/resume 后恢复，并在每次 swarm run 开始时固定快照。默认 Luna 可用时，`reset` 会恢复该默认值。已保存的模型如果不再可用，Swarm 会警告，而不会静默切换到其他模型。
 
 主模型可以调用 `swarm` 工具，提交 1–128 个边界清楚的工作包。默认并发会自适应为 `min(worker 总数, 16)`；调用方也可以指定不超过 16 的更低或明确并发值。一次 run 内的所有 worker 使用已选择的模型和 `medium` thinking。Profile 是运行时强制权限：`explore` 只有 `read`，`coder` 才有 `read`、`bash`、`edit` 和 `write`；为保持兼容，默认是 `coder`。完成的 worker 会返回稳定且按 owner 隔离的 `agentId`，可通过 `resume_agent_ids` 继续；恢复会保留该身份，不会静默替换成新 worker。只有当每个新 worker 都确实需要完整父会话上下文时，才应设置 `fork: true`；resume 与 fork 不能同时使用。仓库调查和只读分析可设置 `subagent_type: "explore"`；实现和验证可设置 `subagent_type: "coder"`。同一 run 的 worker 使用相同的模型快照，但工具权限由运行时硬性区分；已有 `explore` Session 恢复时不能升级成 `coder`。
 
