@@ -29,8 +29,14 @@ assert.deepEqual(listSelectableWorkerModels({
 ]);
 assert.deepEqual(listSelectableWorkerModels({
   scopedModels: [{ model: { provider: "scoped", id: "only", name: "Scoped Only" } }],
-  modelRegistry: { getAvailable: () => [{ provider: "ignored", id: "model" }] },
-}), [{ value: "scoped/only", label: "only [scoped] — Scoped Only" }]);
+  modelRegistry: { getAvailable: () => [
+    { provider: "scoped", id: "only", name: "Scoped Only" },
+    { provider: "available", id: "outside-scope", name: "Outside Scope" },
+  ] },
+}), [
+  { value: "available/outside-scope", label: "outside-scope [available] — Outside Scope" },
+  { value: "scoped/only", label: "only [scoped] — Scoped Only" },
+]);
 
 function fakePi() {
   const handlers = new Map(); const commands = []; const commandDefs = []; const tools = []; const toolDefs = []; const entries = [];
@@ -43,25 +49,30 @@ function fakePi() {
   };
 }
 const ui = { setStatus() {}, notify() {} };
-function fakeCommandContext({ available = [], scopedModels = [], model, choice, hasUI = true } = {}) {
-  const notifications = []; const selections = [];
+function fakeCommandContext({ available = [], scopedModels = [], model, choice, hasUI = true, mode = "tui" } = {}) {
+  const notifications = []; const customRequests = [];
   return {
     hasUI,
+    mode,
     model,
     scopedModels,
     modelRegistry: {
       getAvailable: () => available,
+      find: (provider, modelId) => available.find((candidate) => candidate.provider === provider && candidate.id === modelId),
+      refresh: async () => ({ aborted: false, errors: new Map() }),
+      getError: () => undefined,
       getRegisteredNativeProvider: () => undefined,
       getRegisteredProviderConfig: () => undefined,
     },
     sessionManager: { getSessionId: () => "owner", getSessionFile: () => undefined },
     cwd: process.cwd(),
     notifications,
-    selections,
+    customRequests,
     ui: {
       setStatus() {},
       notify(message, level) { notifications.push({ message, level }); },
-      async select(title, options) { selections.push({ title, options }); return choice; },
+      async custom(factory) { customRequests.push(factory); return choice; },
+      async select() { throw new Error("legacy generic selector must not be used"); },
     },
   };
 }
@@ -117,16 +128,12 @@ const availableModels = [
 const pickerContext = fakeCommandContext({
   available: availableModels,
   model: availableModels[2],
-  choice: "claude-sonnet [anthropic] — Claude Sonnet",
+  choice: availableModels[1],
 });
 const selectedProviderConfig = { baseUrl: "https://example.invalid", api: "anthropic-messages" };
 pickerContext.modelRegistry.getRegisteredProviderConfig = (provider) => provider === "anthropic" ? selectedProviderConfig : undefined;
 await selectable.commandDefs[0].handler("model", pickerContext);
-assert.deepEqual(pickerContext.selections[0].options, [
-  "gpt-5.6-sol [openai-codex] — Sol ✓",
-  "gpt-5.6-luna [openai-codex] — Luna · swarm current",
-  "claude-sonnet [anthropic] — Claude Sonnet",
-]);
+assert.equal(pickerContext.customRequests.length, 1, "the Pi model selector UI must be used");
 assert.deepEqual(selectable.entries.at(-1), {
   type: "pi-swarm-state",
   data: { enabled: false, workerModel: "anthropic/claude-sonnet" },
@@ -138,9 +145,9 @@ await selectable.commandDefs[0].handler("model unknown/model", rejectedContext);
 assert.equal(selectable.entries.length, 1);
 assert.equal(rejectedContext.notifications.at(-1).level, "warning");
 
-const noUiContext = fakeCommandContext({ available: availableModels, hasUI: false });
+const noUiContext = fakeCommandContext({ available: availableModels, hasUI: false, mode: "print" });
 await selectable.commandDefs[0].handler("model", noUiContext);
-assert.equal(noUiContext.selections.length, 0);
+assert.equal(noUiContext.customRequests.length, 0);
 assert.match(noUiContext.notifications.at(-1).message, /provider\/model/);
 
 // Each run snapshots the selected model and passes it to every worker.

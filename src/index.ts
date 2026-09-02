@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { ModelSelectorComponent, type ExtensionAPI, type ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { Text } from "@earendil-works/pi-tui";
@@ -34,7 +34,8 @@ function modelValue(model: ModelLike | undefined): string | undefined {
 
 function selectableWorkerModelChoices(context: WorkerModelContext, currentWorkerModel?: string): WorkerModelChoice[] {
   const scoped = context.scopedModels ?? [];
-  const models = scoped.length > 0 ? scoped.map((entry) => entry.model) : context.modelRegistry?.getAvailable?.() ?? [];
+  const available = context.modelRegistry?.getAvailable?.() ?? [];
+  const models = available.length > 0 ? available : scoped.map((entry) => entry.model);
   const parentModel = modelValue(context.model);
   const choices = new Map<string, WorkerModelChoice>();
   for (const model of models) {
@@ -214,21 +215,37 @@ export function registerSwarmExtension(pi: ExtensionAPI): void {
         ctx.ui.notify(`Swarm ${enabled ? "ON" : "OFF"} · ${workerModel} · ${WORKER_THINKING_LEVEL} · default adaptive up to ${MAX_CONCURRENCY} · max tasks ${MAX_TASKS} · active runs ${active}`, "info"); return;
       }
       if (lower === "model" || lower.startsWith("model ")) {
-        const choices = listSelectableWorkerModels(ctx, workerModel);
         let requested = args.slice("model".length).trim();
         if (!requested) {
-          if (!ctx.hasUI) {
+          if (!ctx.hasUI || ctx.mode !== "tui") {
             ctx.ui.notify("Specify a worker model as provider/model, or run /swarm model in interactive mode.", "warning"); return;
           }
-          if (!choices.length) {
-            ctx.ui.notify("No worker models are available in this Pi session.", "warning"); return;
-          }
-          const selected = await ctx.ui.select(`Worker model (current: ${workerModel})`, choices.map((choice) => choice.label));
+          const currentReference = parseWorkerModel(workerModel);
+          const currentWorkerModel = currentReference
+            ? ctx.modelRegistry.find(currentReference.provider, currentReference.id)
+            : undefined;
+          const pickerRuntime: Pick<ModelRuntime, "refresh" | "getAvailableSnapshot" | "getModel" | "getError"> = {
+            refresh: (options) => ctx.modelRegistry.refresh(options),
+            getAvailableSnapshot: () => ctx.modelRegistry.getAvailable(),
+            getModel: (provider, modelId) => ctx.modelRegistry.find(provider, modelId),
+            getError: () => ctx.modelRegistry.getError(),
+          };
+          const selected = await ctx.ui.custom<ModelLike | undefined>((tui, _theme, _keybindings, done) =>
+            new ModelSelectorComponent(
+              tui,
+              currentWorkerModel ?? ctx.model,
+              pickerRuntime as ModelRuntime,
+              ctx.scopedModels,
+              (model) => done(model),
+              () => done(undefined),
+            )
+          );
           if (!selected) return;
-          requested = choices.find((choice) => choice.label === selected)?.value ?? "";
+          requested = modelValue(selected) ?? "";
         } else if (requested.toLowerCase() === "reset") {
           requested = WORKER_MODEL;
         }
+        const choices = listSelectableWorkerModels(ctx, workerModel);
         const parsed = parseWorkerModel(requested);
         if (!parsed || !choices.some((choice) => choice.value === parsed.value)) {
           ctx.ui.notify(`Worker model ${requested || "(empty)"} is not available in this Pi session.`, "warning"); return;
