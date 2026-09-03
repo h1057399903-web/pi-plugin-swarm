@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 export type SwarmModelCostClass = "free" | "trial" | "subscription" | "metered" | "unknown";
+export const PRIMARY_SWARM_MODEL_ALIAS = "primary" as const;
 
 export interface SwarmModelPoolEntry {
   target: string;
@@ -73,6 +74,7 @@ function parseEntry(value: unknown): SwarmModelPoolEntry {
 export function parseSwarmModelPool(value: unknown): SwarmModelPool {
   if (!isRecord(value)) throw new Error("model pool must be a JSON object");
   if (!validAlias(value.defaultModel)) throw new Error("defaultModel must be a valid alias");
+  if (value.defaultModel === PRIMARY_SWARM_MODEL_ALIAS) throw new Error("primary is reserved and cannot be the configured defaultModel");
   if (!isRecord(value.models)) throw new Error("models must be an alias-to-model object");
 
   const entries = Object.entries(value.models);
@@ -80,6 +82,7 @@ export function parseSwarmModelPool(value: unknown): SwarmModelPool {
   const models: Record<string, SwarmModelPoolEntry> = {};
   for (const [alias, rawEntry] of entries) {
     if (!validAlias(alias)) throw new Error(`invalid model alias: ${alias.slice(0, MAX_ALIAS_LENGTH)}`);
+    if (alias === PRIMARY_SWARM_MODEL_ALIAS) throw new Error("primary is a reserved Swarm model alias");
     models[alias] = parseEntry(rawEntry);
   }
   if (!Object.hasOwn(models, value.defaultModel)) throw new Error("defaultModel must name one of the configured aliases");
@@ -118,5 +121,6 @@ export function describeSwarmModelPool(pool: SwarmModelPool): string {
     const flags = `${alias === pool.defaultModel ? " [default]" : ""} [${entry.costClass}]`;
     lines.push(`- ${alias}${flags}${entry.description ? `: ${entry.description}` : ""}`);
   }
+  lines.push(`- ${PRIMARY_SWARM_MODEL_ALIAS} [main]: current main model with its current thinking level; use for hard or quality-sensitive work`);
   return lines.join("\n");
 }
