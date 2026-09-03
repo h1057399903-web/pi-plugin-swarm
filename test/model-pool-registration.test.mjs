@@ -119,11 +119,20 @@ try {
     assert.equal(primary.details.workers[0].thinking, "xhigh");
     assert.doesNotMatch(JSON.stringify(primary.details), /synthetic\/outside-endpoint/);
 
+    ctx.thinkingLevel = undefined;
+    const primaryDefaultThinking = await pi.toolDefs[0].execute("pool-primary-default-thinking", {
+      description: "hard reasoning without runtime thinking",
+      model: "primary",
+      items: ["one"],
+    }, undefined, undefined, ctx);
+    assert.equal(seen.at(-1).thinkingLevel, "medium");
+    assert.equal(primaryDefaultThinking.details.workers[0].thinking, "medium");
+
     await assert.rejects(
       pi.toolDefs[0].execute("pool-outside", { description: "outside", model: "outside", items: ["one"] }, undefined, undefined, ctx),
       /not whitelisted/,
     );
-    assert.equal(seen.length, 4, "non-whitelisted aliases must fail before worker creation");
+    assert.equal(seen.length, 5, "non-whitelisted aliases must fail before worker creation");
   } finally {
     SwarmAgentRuntime.prototype.run = originalRun;
   }
