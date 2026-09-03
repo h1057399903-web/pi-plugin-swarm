@@ -25,8 +25,8 @@ const SAFE_TASK_MESSAGES = new Set([
 
 function statusOf(error: unknown): number | undefined {
   if (!error || typeof error !== "object") return undefined;
-  const candidate = error as { status?: unknown; statusCode?: unknown };
-  for (const value of [candidate.status, candidate.statusCode]) {
+  const candidate = error as { status?: unknown; statusCode?: unknown; code?: unknown };
+  for (const value of [candidate.status, candidate.statusCode, candidate.code]) {
     if (typeof value === "number" && Number.isFinite(value)) return value;
     if (typeof value === "string" && /^\d{3}$/.test(value)) return Number(value);
   }

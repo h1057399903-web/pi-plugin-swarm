@@ -10,6 +10,10 @@ assert.deepEqual(classifyWorkerFailure(error("too many requests", { status: 429 
   kind: "rate_limited",
   safeMessage: "Provider rate limit.",
 });
+assert.deepEqual(classifyWorkerFailure(error("provider code only", { code: "429" })), {
+  kind: "rate_limited",
+  safeMessage: "Provider rate limit.",
+});
 assert.deepEqual(classifyWorkerFailure(error("Monthly usage limit reached", { status: 429 })), {
   kind: "quota_exhausted",
   safeMessage: "Model quota exhausted.",
