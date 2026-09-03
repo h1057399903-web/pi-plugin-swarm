@@ -13,7 +13,7 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test:unit": "node --experimental-transform-types test/swarm-batch.test.mjs && node --experimental-transform-types test/lightweight-coordination.test.mjs && node --experimental-transform-types test/model-failure.test.mjs && node --experimental-transform-types test/swarm-agent-runtime.test.mjs && node --experimental-transform-types test/public-api.test.mjs && node --experimental-transform-types test/registration.test.mjs",
+    "test:unit": "node --experimental-transform-types test/swarm-batch.test.mjs && node --experimental-transform-types test/lightweight-coordination.test.mjs && node --experimental-transform-types test/model-failure.test.mjs && node --experimental-transform-types test/model-pool.test.mjs && node --experimental-transform-types test/swarm-agent-runtime.test.mjs && node --experimental-transform-types test/public-api.test.mjs && node --experimental-transform-types test/registration.test.mjs && node --experimental-transform-types test/model-pool-registration.test.mjs",
     "smoke": "bash test/smoke.sh",
     "smoke:packed": "bash test/packed-smoke.sh",
     "test:live:16": "node --experimental-transform-types test/live-16.mjs",
