@@ -125,7 +125,20 @@ export function countSwarmWorkers(args: {
 }
 
 function safeError(value: unknown): string {
-  if (value instanceof Error && ["Worker failed.", "Worker timed out.", "Worker session is unavailable.", "Worker session is busy.", "Worker cwd is outside the parent working directory.", "Provider rate limit."].includes(value.message)) return value.message;
+  if (value instanceof Error && [
+    "Worker failed.",
+    "Worker timed out.",
+    "Worker session is unavailable.",
+    "Worker session is busy.",
+    "Worker cwd is outside the parent working directory.",
+    "Worker model is unavailable.",
+    "Model quota exhausted.",
+    "Model authentication unavailable.",
+    "Provider temporarily unavailable.",
+    "Worker context is incompatible.",
+    "Provider rate limit.",
+    "Aborted.",
+  ].includes(value.message)) return value.message;
   return "Worker failed.";
 }
 
@@ -440,7 +453,9 @@ export function registerSwarmExtension(pi: ExtensionAPI): void {
         const publicWorker = publicWorkers.get(worker.workerId);
         const result = worker.question
           ? `Question: ${publicWorker?.question ?? "[redacted]"}`
-          : worker.output || worker.error || "(no output)";
+          : worker.failureKind
+            ? `Failure: ${worker.failureKind}\n${worker.error ?? "Worker failed."}${worker.output ? `\nPartial output:\n${worker.output}` : ""}`
+            : worker.output || worker.error || "(no output)";
         return `### Worker ${worker.index + 1}: ${publicWorker?.item ?? "[redacted]"} — ${worker.status}\nAgent ID: ${worker.agentId}${worker.resumable ? " (resumable)" : ""}\n${result}`;
       });
       const resumeHint = resumeAgentIdsHint(publicRun?.workers ?? []);
@@ -460,7 +475,7 @@ export function registerSwarmExtension(pi: ExtensionAPI): void {
       for (const worker of run.workers) {
         const status = worker.status as string;
         const icon = status === "completed" ? "✓" : status === "failed" || status === "rate_limited" ? "✗" : status === "aborted" ? "■" : status === "blocked" ? "?" : status === "suspended" ? "Ⅱ" : "⏳";
-        text += `\n  ${icon} ${worker.item}${status === "suspended" ? " (suspended)" : ""}`;
+        text += `\n  ${icon} ${worker.item}${status === "suspended" ? " (suspended)" : ""}${worker.failureKind ? ` · ${worker.failureKind}` : ""}`;
         if (worker.turns) text += theme.fg("dim", ` · ${worker.turns} turns · ↓${worker.outputTokens}`);
       }
       text += theme.fg("dim", `\n${run.workers[0]?.model ?? WORKER_MODEL} · ${WORKER_THINKING_LEVEL} · capacity ${run.activeCapacity}/${run.requestedConcurrency}`);
@@ -475,6 +490,7 @@ function applyWorkerResult(worker: InternalSwarmWorker, result: WorkerResult): v
   worker.agentId = result.agentId;
   worker.resumable = result.resumable;
   worker.status = result.status;
+  worker.failureKind = result.failureKind;
   worker.startedAt = result.startedAt;
   worker.finishedAt = result.finishedAt;
   worker.durationMs = result.durationMs;
