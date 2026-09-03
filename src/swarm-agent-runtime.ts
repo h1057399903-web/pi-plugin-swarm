@@ -11,6 +11,7 @@ import { realpath } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, win32 } from "node:path";
 import { Type } from "typebox";
 import { resolveWorkspaceTarget, type ResolvedWorkspaceTarget } from "./lightweight-coordination.ts";
+import { classifyWorkerFailure, type WorkerFailureKind } from "./model-failure.ts";
 
 export const WORKER_MODEL = "openai-codex/gpt-5.6-luna";
 export const WORKER_THINKING_LEVEL = "medium" as const;
@@ -57,7 +58,7 @@ export interface WorkerProgress {
 export interface WorkerUsage { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number; }
 export interface WorkerResult {
   workerId: string; agentId: string; resumable: boolean; status: WorkerStatus; startedAt?: number; finishedAt: number; durationMs: number;
-  turns: number; usage: WorkerUsage; output: string; profile: WorkerProfile; item?: unknown; error?: string;
+  turns: number; usage: WorkerUsage; output: string; profile: WorkerProfile; item?: unknown; error?: string; failureKind?: WorkerFailureKind;
   toolCalls: WorkerToolCounters; currentTool?: WorkerToolName; currentTarget?: string; lastActivityAt?: number; question?: string;
 }
 
@@ -101,25 +102,8 @@ function usageOf(message: any): WorkerUsage {
 function addUsage(a: WorkerUsage, b: WorkerUsage): void {
   a.input += b.input; a.output += b.output; a.cacheRead += b.cacheRead; a.cacheWrite += b.cacheWrite; a.cost += b.cost;
 }
-function isRateLimit(error: unknown): boolean {
-  const e: any = error;
-  return e?.status === 429 || e?.statusCode === 429 || e?.code === 429 || e?.code === "429" ||
-    e?.code === "rate_limit_exceeded" || e?.name === "APIProviderRateLimitError" || e?.name === "RateLimitError";
-}
 const SESSION_UNAVAILABLE = "Worker session is unavailable.";
 const CWD_UNAVAILABLE = "Worker cwd is outside the parent working directory.";
-const SAFE_ERROR_MESSAGES = new Set([
-  "Worker model is unavailable.", SESSION_UNAVAILABLE, "Worker session is busy.",
-  "Worker timed out.", "Worker profile mismatch.", CWD_UNAVAILABLE,
-]);
-function safeError(error: unknown): string {
-  if (isRateLimit(error)) return "Provider rate limit.";
-  if (error instanceof Error) {
-    if (error.name === "AbortError") return "Aborted.";
-    if (SAFE_ERROR_MESSAGES.has(error.message)) return error.message;
-  }
-  return "Worker failed.";
-}
 const ACTIVE_AGENTS_KEY = Symbol.for("pi-plugin-swarm.active-agents.v1");
 type GlobalWithActiveAgents = typeof globalThis & { [ACTIVE_AGENTS_KEY]?: Set<string> };
 function activeAgents(): Set<string> {
@@ -382,14 +366,18 @@ export class SwarmAgentRuntime {
       const finished = this.seams.now?.() ?? Date.now();
       return { workerId: input.workerId, agentId, resumable: resumable && sessionAvailable, status: resultStatus, startedAt: started, finishedAt: finished, durationMs: finished - started, turns, usage, output: cap(output), profile, item, ...activity() };
     } catch (error) {
-      const aborted = !timedOut && (state.controller.signal.aborted || (error as any)?.name === "AbortError");
-      const rate = isRateLimit(error);
-      const resultStatus: WorkerStatus = rate ? "rate_limited" : aborted ? "aborted" : "failed";
+      const classified = timedOut
+        ? { kind: "task_failed" as const, safeMessage: "Worker timed out." }
+        : classifyWorkerFailure(error);
+      const aborted = !timedOut && (state.controller.signal.aborted || classified.kind === "aborted");
+      const failureKind: WorkerFailureKind = aborted ? "aborted" : classified.kind;
+      const resultStatus: WorkerStatus = failureKind === "rate_limited" ? "rate_limited" : aborted ? "aborted" : "failed";
+      const errorMessage = aborted ? "Aborted." : classified.safeMessage;
       terminal = true;
       activeTools.clear();
       report(resultStatus);
       const finished = this.seams.now?.() ?? Date.now();
-      return { workerId: input.workerId, agentId, resumable: resumable && sessionAvailable, status: resultStatus, startedAt: started, finishedAt: finished, durationMs: finished - started, turns, usage, output: cap(output), profile, item, error: timedOut ? "Worker timed out." : safeError(error), ...activity() };
+      return { workerId: input.workerId, agentId, resumable: resumable && sessionAvailable, status: resultStatus, startedAt: started, finishedAt: finished, durationMs: finished - started, turns, usage, output: cap(output), profile, item, error: errorMessage, failureKind, ...activity() };
     } finally {
       if (timer) clearTimeout(timer);
       unsubscribe?.();
