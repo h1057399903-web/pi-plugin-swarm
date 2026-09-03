@@ -30,12 +30,15 @@ assert.deepEqual(pool.models["durable-coder"], {
 const summary = describeSwarmModelPool(pool);
 assert.match(summary, /free-research \[free\]/);
 assert.match(summary, /durable-coder \[default\] \[unknown\]/);
+assert.match(summary, /primary \[main\]/);
 assert.doesNotMatch(summary, /synthetic\/free-model|synthetic\/durable-model/, "coordinator summary must not expose local targets");
 
 assert.throws(() => parseSwarmModelPool({ defaultModel: "missing", models: { allowed: "synthetic/model" } }), /defaultModel/);
 assert.throws(() => parseSwarmModelPool({ defaultModel: "bad alias", models: { "bad alias": "synthetic/model" } }), /alias/);
 assert.throws(() => parseSwarmModelPool({ defaultModel: "a", models: { a: "missing-provider" } }), /provider\/model/);
 assert.throws(() => parseSwarmModelPool({ defaultModel: "a", models: { a: { target: "synthetic/model", costClass: "magic" } } }), /costClass/);
+assert.throws(() => parseSwarmModelPool({ defaultModel: "primary", models: { allowed: "synthetic/model" } }), /primary is reserved/);
+assert.throws(() => parseSwarmModelPool({ defaultModel: "allowed", models: { primary: "synthetic/model", allowed: "synthetic/other" } }), /reserved Swarm model alias/);
 
 const dir = mkdtempSync(join(tmpdir(), "swarm-model-pool-"));
 try {
