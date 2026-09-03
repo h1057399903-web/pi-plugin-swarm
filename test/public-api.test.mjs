@@ -23,10 +23,10 @@ integration.updateRun({
   requestedConcurrency: 2,
   activeCapacity: 2,
   workers: [{
-    workerId: "worker-1", agentId: "agent-1", resumed: false, resumable: true, index: 0, item: "one token=item-secret /repo/private/item", status: "blocked", attempt: 1,
+    workerId: "worker-1", agentId: "agent-1", resumed: false, resumable: true, index: 0, item: "one token=item-secret /repo/private/item", status: "blocked", failureKind: "model_unavailable", attempt: 1,
     turns: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cost: 0,
     model: "openai-codex/gpt-5.6-luna", thinking: "medium", profile: "coder", output: "private transcript", error: "private error",
-    cwd: "C:/private/project", sessionPath: "C:/private/session.json",
+    cwd: "C:/private/project", sessionPath: "C:/private/session.json", rawFailure: "SECRET raw provider payload",
     toolCalls: { read: 14, bash: 3, edit: 2, write: 2_000_000, report_blocked: 1, evil: 99, negative: -1 },
     currentTool: "evil", currentTarget: "../secret.txt", lastActivityAt: 12,
     touchedFiles: ["src/a.ts", "src/a.ts", "../secret", "/absolute", "C:/private", "src/b.ts"],
@@ -42,7 +42,9 @@ assert.doesNotMatch(snapshot.runs[0].description, /description-secret|C:\\privat
 assert.doesNotMatch(snapshot.runs[0].workers[0].item, /item-secret|\/repo\/private/);
 assert.equal(snapshot.runs[0].workers[0].output, undefined);
 assert.equal(snapshot.runs[0].workers[0].error, undefined);
+assert.equal(snapshot.runs[0].workers[0].rawFailure, undefined);
 assert.equal(snapshot.runs[0].workers[0].status, "blocked");
+assert.equal(snapshot.runs[0].workers[0].failureKind, "model_unavailable");
 assert.deepEqual(snapshot.runs[0].workers[0].toolCalls, { read: 14, bash: 3, edit: 2, write: 1_000_000, report_blocked: 1 });
 assert.equal(snapshot.runs[0].workers[0].currentTool, undefined);
 assert.equal(snapshot.runs[0].workers[0].currentTarget, undefined);
@@ -67,12 +69,13 @@ assert.equal(integration.cancelRun("run-1"), false);
 integration.updateRun({
   runId: "old", description: "old", status: "blocked", createdAt: 2,
   requestedConcurrency: 1, activeCapacity: 1,
-  workers: [{ workerId: "w", agentId: "a", resumed: false, resumable: false, index: 0, item: "old", status: "queued", attempt: 0,
+  workers: [{ workerId: "w", agentId: "a", resumed: false, resumable: false, index: 0, item: "old", status: "queued", failureKind: "not-a-real-kind", attempt: 0,
     turns: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cost: 0,
     model: "m".repeat(300), thinking: "low".repeat(30), currentTarget: "src/ok.ts", question: "token=x ".repeat(100) }],
 });
 assert.doesNotThrow(() => integration.snapshot());
 assert.equal(integration.snapshot().runs.at(-1).workers[0].toolCalls, undefined);
+assert.equal(integration.snapshot().runs.at(-1).workers[0].failureKind, undefined);
 assert.equal(integration.snapshot().runs.at(-1).workers[0].currentTarget, "src/ok.ts");
 assert.equal(integration.snapshot().runs.at(-1).workers[0].question.length, 500);
 assert.doesNotMatch(integration.snapshot().runs.at(-1).workers[0].question, /token=x/);
