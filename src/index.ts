@@ -4,10 +4,10 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { Text } from "@earendil-works/pi-tui";
 import { SwarmBatch, type SwarmTaskStatus } from "./features/swarm-batch.ts";
-import { SwarmAgentRuntime, WORKER_MODEL, WORKER_THINKING_LEVEL, parseWorkerModel, type WorkerProviderRegistration, type WorkerResult } from "./swarm-agent-runtime.ts";
+import { SwarmAgentRuntime, WORKER_MODEL, WORKER_THINKING_LEVEL, parseWorkerModel, type WorkerProviderRegistration, type WorkerResult, type WorkerThinkingLevel } from "./swarm-agent-runtime.ts";
 import { getSwarmIntegration, type PublicSwarmRun, type PublicSwarmWorker } from "./public-api.ts";
 import { LightweightCoordination } from "./lightweight-coordination.ts";
-import { describeSwarmModelPool, loadSwarmModelPool, type SwarmModelPoolLoadResult } from "./model-pool.ts";
+import { PRIMARY_SWARM_MODEL_ALIAS, describeSwarmModelPool, loadSwarmModelPool, type SwarmModelPoolLoadResult } from "./model-pool.ts";
 
 const MAX_TASKS = 128;
 const MAX_CONCURRENCY = 16;
@@ -15,6 +15,7 @@ const INITIAL_LAUNCH_LIMIT = 5;
 const LAUNCH_STAGGER_MS = 700;
 const STATE_TYPE = "pi-swarm-state";
 const RUN_STATE_TYPE = "pi-swarm-run-v1";
+const WORKER_THINKING_LEVELS = new Set<WorkerThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 
 export type SwarmSubagentType = "explore" | "coder";
 interface SwarmTask { item: string; prompt?: string; cwd?: string; timeoutMs?: number; agentId?: string; resume?: boolean; subagent_type?: SwarmSubagentType; }
@@ -31,6 +32,12 @@ function modelValue(model: ModelLike | undefined): string | undefined {
   if (typeof model?.provider !== "string" || typeof model.id !== "string") return undefined;
   const value = `${model.provider}/${model.id}`;
   return parseWorkerModel(value)?.value;
+}
+
+function normalizeWorkerThinkingLevel(value: unknown): WorkerThinkingLevel {
+  return typeof value === "string" && WORKER_THINKING_LEVELS.has(value as WorkerThinkingLevel)
+    ? value as WorkerThinkingLevel
+    : WORKER_THINKING_LEVEL;
 }
 
 function selectableWorkerModelChoices(context: WorkerModelContext, currentWorkerModel?: string): WorkerModelChoice[] {
@@ -110,7 +117,7 @@ const SwarmParameters = Type.Object({
   fork: Type.Optional(Type.Boolean({ description: "Fork the current parent conversation into every new worker; incompatible with resume agent IDs" })),
   promptTemplate: Type.Optional(Type.String({ description: "Template for tasks without prompt; replace {{item}}" })),
   prompt_template: Type.Optional(Type.String({ description: "Kimi-compatible alias for promptTemplate" })),
-  model: Type.Optional(Type.String({ minLength: 1, maxLength: 64, description: "Optional whitelisted Swarm model alias for this run; requires a local model pool" })),
+  model: Type.Optional(Type.String({ minLength: 1, maxLength: 64, description: "Optional whitelisted Swarm model alias for this run; primary reuses the current main model and thinking level" })),
   concurrency: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_CONCURRENCY, description: "Maximum active workers; defaults to min(total workers, 16)" })),
 });
 
@@ -150,7 +157,7 @@ function publicStatus(status: SwarmTaskStatus): PublicSwarmWorker["status"] {
 
 interface InternalSwarmWorker extends PublicSwarmWorker { output?: string; error?: string; }
 
-function makeWorker(runId: string, task: SwarmTask, index: number, resumable: boolean, model: string): InternalSwarmWorker {
+function makeWorker(runId: string, task: SwarmTask, index: number, resumable: boolean, model: string, thinking: WorkerThinkingLevel = WORKER_THINKING_LEVEL): InternalSwarmWorker {
   return {
     workerId: `${runId}:${index + 1}`,
     agentId: task.agentId ?? randomUUID(),
@@ -166,7 +173,7 @@ function makeWorker(runId: string, task: SwarmTask, index: number, resumable: bo
     cacheReadTokens: 0,
     cost: 0,
     model,
-    thinking: WORKER_THINKING_LEVEL,
+    thinking,
     toolCalls: {},
     touchedFiles: [],
     overlapFiles: [],
@@ -223,7 +230,7 @@ export function registerSwarmExtension(pi: ExtensionAPI): void {
     const modelGuidance = modelPool.error
       ? "The local Swarm model pool is invalid. Do not call the swarm tool until the user fixes it and reloads."
       : modelPool.pool
-        ? `${describeSwarmModelPool(modelPool.pool)}\nChoose an alias based on the current task. Omit swarm.model to use ${modelPool.pool.defaultModel}. The aliases are the only allowed Swarm models.`
+        ? `${describeSwarmModelPool(modelPool.pool)}\nChoose a listed name based on the current task. Use primary for hard or quality-sensitive work. Omit swarm.model to use ${modelPool.pool.defaultModel}.`
         : `Workers use ${workerModel} at ${WORKER_THINKING_LEVEL}.`;
     return { systemPrompt: `${event.systemPrompt}\n\nSWARM MODE IS ACTIVE. ${COORDINATOR_GUIDANCE}\n${modelGuidance} Never delegate credentials, production mutation, deployments, service restarts, device installation, merges, or overlapping edits.` };
   });
@@ -253,7 +260,7 @@ export function registerSwarmExtension(pi: ExtensionAPI): void {
         const modelStatus = modelPool.error
           ? "model pool INVALID"
           : modelPool.pool
-            ? `pool ${Object.keys(modelPool.pool.models).length} · default ${modelPool.pool.defaultModel}`
+            ? `pool ${Object.keys(modelPool.pool.models).length} + primary · default ${modelPool.pool.defaultModel}`
             : `${workerModel} · ${WORKER_THINKING_LEVEL}`;
         ctx.ui.notify(`Swarm ${enabled ? "ON" : "OFF"} · ${modelStatus} · default adaptive up to ${MAX_CONCURRENCY} · max tasks ${MAX_TASKS} · active runs ${active}`, modelPool.error ? "warning" : "info"); return;
       }
@@ -262,8 +269,8 @@ export function registerSwarmExtension(pi: ExtensionAPI): void {
           if (modelPool.error) {
             ctx.ui.notify(modelPool.error, "warning"); return;
           }
-          const aliases = Object.keys(modelPool.pool?.models ?? {});
-          ctx.ui.notify(`Swarm model pool is active. Default: ${modelPool.pool?.defaultModel}. Per-run aliases: ${aliases.join(", ")}. Edit the local swarm-models.json and /reload to change the whitelist.`, "info");
+          const aliases = [...Object.keys(modelPool.pool?.models ?? {}), PRIMARY_SWARM_MODEL_ALIAS];
+          ctx.ui.notify(`Swarm model pool is active. Default: ${modelPool.pool?.defaultModel}. Per-run names: ${aliases.join(", ")}. primary always means the current main model and its current thinking level. Edit the local swarm-models.json and /reload to change the whitelist.`, "info");
           return;
         }
         let requested = args.slice("model".length).trim();
@@ -318,12 +325,12 @@ export function registerSwarmExtension(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "swarm",
     label: "Swarm",
-    description: `Launch or resume a bounded task swarm using in-process Pi AgentSessions. Supports 1-${MAX_TASKS} tasks, up to ${MAX_CONCURRENCY} active workers, stable resumable agent IDs, optional parent-context fork, initial burst ${INITIAL_LAUNCH_LIMIT}, then staggered launches. A private local model pool may whitelist aliases for per-run model choice without adding router model calls.`,
+    description: `Launch or resume a bounded task swarm using in-process Pi AgentSessions. Supports 1-${MAX_TASKS} tasks, up to ${MAX_CONCURRENCY} active workers, stable resumable agent IDs, optional parent-context fork, initial burst ${INITIAL_LAUNCH_LIMIT}, then staggered launches. A private local model pool may whitelist aliases for per-run model choice; primary reuses the current main model and thinking level without adding a router call.`,
     promptSnippet: "Delegate bounded independent packages to in-process Pi workers",
     promptGuidelines: [
       "Use as many workers as are useful for independent packages with non-overlapping file ownership; use one only for a single or serial package.",
       "Use subagent_type explore for read-only investigation and coder only when the worker must run commands or modify files.",
-      "When the coordinator prompt lists a Swarm model pool, choose only one of those aliases via model; omit model to use the listed default.",
+      "When the coordinator prompt lists a Swarm model pool, choose one listed alias via model; use primary for hard or quality-sensitive work; omit model to use the listed default.",
       "Never delegate credentials, production mutations, deployments, service restarts, device installation, or merges.",
       "Inspect worker changes and verification evidence before accepting them.",
       "Use resume_agent_ids for follow-up work by a prior worker; use fork only when every new worker requires the parent conversation context.",
@@ -348,25 +355,39 @@ export function registerSwarmExtension(pi: ExtensionAPI): void {
 
       let runWorkerModel = workerModel;
       let runPublicModel = workerModel;
+      let runThinkingLevel: WorkerThinkingLevel = WORKER_THINKING_LEVEL;
+      let primaryModelDefinition: ModelLike | undefined;
       if (modelPool.pool) {
         const requestedAlias = typeof params.model === "string" ? params.model : modelPool.pool.defaultModel;
-        const entry = modelPool.pool.models[requestedAlias];
-        if (!entry) throw new Error(`Swarm model alias ${requestedAlias} is not whitelisted.`);
-        runWorkerModel = entry.target;
-        runPublicModel = requestedAlias;
+        if (requestedAlias === PRIMARY_SWARM_MODEL_ALIAS) {
+          const primaryModel = modelValue(ctx.model);
+          if (!primaryModel || !ctx.model) throw new Error("Primary Swarm model is unavailable in this Pi session.");
+          runWorkerModel = primaryModel;
+          runPublicModel = PRIMARY_SWARM_MODEL_ALIAS;
+          runThinkingLevel = normalizeWorkerThinkingLevel(ctx.thinkingLevel);
+          primaryModelDefinition = ctx.model;
+        } else {
+          const entry = modelPool.pool.models[requestedAlias];
+          if (!entry) throw new Error(`Swarm model alias ${requestedAlias} is not whitelisted.`);
+          runWorkerModel = entry.target;
+          runPublicModel = requestedAlias;
+        }
       } else if (params.model !== undefined) {
         throw new Error("Swarm model aliases require a configured local model pool.");
       }
 
       const choices = selectableWorkerModelChoices(ctx, runWorkerModel);
       const canValidateModel = choices.length > 0 || typeof ctx.modelRegistry?.getAvailable === "function" || (ctx.scopedModels?.length ?? 0) > 0;
-      const modelChoice = choices.find((choice) => choice.value === runWorkerModel);
+      const modelChoice = primaryModelDefinition
+        ? { value: runWorkerModel, label: PRIMARY_SWARM_MODEL_ALIAS, model: primaryModelDefinition }
+        : choices.find((choice) => choice.value === runWorkerModel);
       if (canValidateModel && !modelChoice) {
         if (modelPool.pool) throw new Error(`Swarm model alias ${runPublicModel} is not available in this Pi session.`);
         throw new Error(`Selected worker model ${runWorkerModel} is not available in this Pi session. Choose another with /swarm model.`);
       }
       const parsedWorkerModel = parseWorkerModel(runWorkerModel);
       if (!parsedWorkerModel) {
+        if (runPublicModel === PRIMARY_SWARM_MODEL_ALIAS) throw new Error("Primary Swarm model is unavailable in this Pi session.");
         if (modelPool.pool) throw new Error(`Swarm model alias ${runPublicModel} has an invalid local target.`);
         throw new Error("Selected worker model is invalid. Choose another with /swarm model.");
       }
@@ -384,7 +405,7 @@ export function registerSwarmExtension(pi: ExtensionAPI): void {
       const requestedConcurrency = resolveSwarmConcurrency(tasks.length, params.concurrency);
       const runId = randomUUID();
       const workers = tasks.map((task, index) => {
-        const worker = makeWorker(runId, task, index, resumable, runPublicModel);
+        const worker = makeWorker(runId, task, index, resumable, runPublicModel, runThinkingLevel);
         if (!task.resume) worker.profile = task.subagent_type ?? "coder";
         return worker;
       });
@@ -435,6 +456,7 @@ export function registerSwarmExtension(pi: ExtensionAPI): void {
             item: task.item,
             timeoutMs: task.timeoutMs,
             model: runWorkerModel,
+            thinkingLevel: runThinkingLevel,
             modelDefinition: modelChoice?.model,
             providerRegistration,
             profile: task.resume ? undefined : task.subagent_type ?? "coder",
@@ -534,7 +556,7 @@ export function registerSwarmExtension(pi: ExtensionAPI): void {
         text += `\n  ${icon} ${worker.item}${status === "suspended" ? " (suspended)" : ""}${worker.failureKind ? ` · ${worker.failureKind}` : ""}`;
         if (worker.turns) text += theme.fg("dim", ` · ${worker.turns} turns · ↓${worker.outputTokens}`);
       }
-      text += theme.fg("dim", `\n${run.workers[0]?.model ?? WORKER_MODEL} · ${WORKER_THINKING_LEVEL} · capacity ${run.activeCapacity}/${run.requestedConcurrency}`);
+      text += theme.fg("dim", `\n${run.workers[0]?.model ?? WORKER_MODEL} · ${run.workers[0]?.thinking ?? WORKER_THINKING_LEVEL} · capacity ${run.activeCapacity}/${run.requestedConcurrency}`);
       const hint = resumeAgentIdsHint(run.workers);
       if (hint) text += theme.fg("dim", `\n${hint}`);
       return new Text(text, 0, 0);
