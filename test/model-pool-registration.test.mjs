@@ -117,6 +117,19 @@ try {
     legacyPi.toolDefs[0].execute("legacy-alias", { description: "x", model: "free-research", items: ["one"] }, undefined, undefined, legacyCtx),
     /require a configured local model pool/,
   );
+
+  writeFileSync(configPath, "{invalid-json");
+  process.env.PI_SWARM_MODEL_POOL = configPath;
+  const invalidPi = fakePi();
+  registerSwarmExtension(invalidPi);
+  const invalidCtx = context(available);
+  invalidPi.handlers.get("session_start")[0]({}, invalidCtx);
+  assert.equal(invalidCtx.notifications.at(-1).level, "warning");
+  assert.match(invalidCtx.notifications.at(-1).message, /configuration is invalid/);
+  await assert.rejects(
+    invalidPi.toolDefs[0].execute("invalid-pool", { description: "x", items: ["one"] }, undefined, undefined, invalidCtx),
+    /configuration is invalid/,
+  );
 } finally {
   if (previous === undefined) delete process.env.PI_SWARM_MODEL_POOL;
   else process.env.PI_SWARM_MODEL_POOL = previous;
