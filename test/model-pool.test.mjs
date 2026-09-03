@@ -55,6 +55,11 @@ try {
   assert.equal(loaded.error, undefined);
   assert.equal(loaded.pool.defaultModel, "research");
 
+  writeFileSync(path, JSON.stringify({ defaultModel: "primary", models: { allowed: "synthetic/research" } }));
+  const reservedDefault = loadSwarmModelPool(dir, { PI_SWARM_MODEL_POOL: path });
+  assert.equal(reservedDefault.configured, true);
+  assert.match(reservedDefault.error, /primary is reserved/);
+
   writeFileSync(path, "{not-json");
   const invalid = loadSwarmModelPool(dir, { PI_SWARM_MODEL_POOL: path });
   assert.equal(invalid.configured, true);
