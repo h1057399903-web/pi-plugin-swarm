@@ -1,4 +1,5 @@
 export type PublicWorkerStatus = "queued" | "starting" | "running" | "completed" | "failed" | "aborted" | "rate_limited" | "suspended" | "blocked";
+export type PublicWorkerFailureKind = "rate_limited" | "quota_exhausted" | "model_unavailable" | "auth_failed" | "provider_transient" | "context_incompatible" | "task_failed" | "aborted";
 export type PublicToolName = "read" | "bash" | "edit" | "write" | "report_blocked";
 export type PublicToolCounters = Partial<Record<PublicToolName, number>>;
 
@@ -14,6 +15,8 @@ export interface PublicSwarmWorker {
   index: number;
   item: string;
   status: PublicWorkerStatus;
+  /** Safe provider/task failure category; raw provider error text is never public. */
+  failureKind?: PublicWorkerFailureKind;
   attempt: number;
   startedAt?: number;
   finishedAt?: number;
@@ -88,11 +91,16 @@ const MAX_MODEL_LENGTH = 200;
 const MAX_THINKING_LENGTH = 50;
 const MAX_WORKERS_PER_RUN = 128;
 const SAFE_TOOLS = new Set<PublicToolName>(["read", "bash", "edit", "write", "report_blocked"]);
+const SAFE_FAILURE_KINDS = new Set<PublicWorkerFailureKind>(["rate_limited", "quota_exhausted", "model_unavailable", "auth_failed", "provider_transient", "context_incompatible", "task_failed", "aborted"]);
 
 type GlobalWithSwarm = typeof globalThis & { [KEY]?: SwarmIntegration };
 
 function cloneProfile(profile: PublicSwarmProfile | undefined): PublicSwarmProfile | undefined {
   return profile === "explore" || profile === "coder" ? profile : undefined;
+}
+
+function safeFailureKind(kind: unknown): PublicWorkerFailureKind | undefined {
+  return typeof kind === "string" && SAFE_FAILURE_KINDS.has(kind as PublicWorkerFailureKind) ? kind as PublicWorkerFailureKind : undefined;
 }
 
 function boundedText(value: unknown, maxLength: number): string {
@@ -170,6 +178,7 @@ function cloneWorker(worker: PublicSwarmWorker): PublicSwarmWorker {
     index: worker.index,
     item: safeLabel(worker.item, MAX_ITEM_LENGTH),
     status: worker.status,
+    ...(safeFailureKind(worker.failureKind) === undefined ? {} : { failureKind: safeFailureKind(worker.failureKind) }),
     attempt: worker.attempt,
     ...(worker.startedAt === undefined ? {} : { startedAt: worker.startedAt }),
     ...(worker.finishedAt === undefined ? {} : { finishedAt: worker.finishedAt }),
