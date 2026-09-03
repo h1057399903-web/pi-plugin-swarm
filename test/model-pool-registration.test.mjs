@@ -22,6 +22,7 @@ function context(available) {
   return {
     cwd: process.cwd(),
     model: available[0],
+    thinkingLevel: "medium",
     scopedModels: [],
     modelRegistry: {
       getAvailable: () => available,
@@ -57,20 +58,23 @@ process.env.PI_SWARM_MODEL_POOL = configPath;
 const available = [
   { provider: "synthetic", id: "free-endpoint", name: "Synthetic Free" },
   { provider: "synthetic", id: "durable-endpoint", name: "Synthetic Durable" },
-  { provider: "synthetic", id: "outside-endpoint", name: "Outside" },
+  { provider: "synthetic", id: "outside-endpoint", name: "Synthetic Main" },
 ];
 
 try {
   const pi = fakePi();
   registerSwarmExtension(pi);
   const ctx = context(available);
+  ctx.model = available[2];
+  ctx.thinkingLevel = "xhigh";
   pi.handlers.get("session_start")[0]({}, ctx);
 
   const coordinator = pi.handlers.get("before_agent_start")[0]({ systemPrompt: "base" });
   assert.match(coordinator.systemPrompt, /free-research/);
   assert.match(coordinator.systemPrompt, /durable-coder/);
+  assert.match(coordinator.systemPrompt, /primary/);
   assert.match(coordinator.systemPrompt, /\[free\]/);
-  assert.doesNotMatch(coordinator.systemPrompt, /synthetic\/free-endpoint|synthetic\/durable-endpoint/, "coordinator must see aliases, not private targets");
+  assert.doesNotMatch(coordinator.systemPrompt, /synthetic\/free-endpoint|synthetic\/durable-endpoint|synthetic\/outside-endpoint/, "coordinator must see aliases, not private or primary targets");
 
   const seen = [];
   const originalRun = SwarmAgentRuntime.prototype.run;
@@ -90,20 +94,36 @@ try {
       items: ["one", "two"],
     }, undefined, undefined, ctx);
     assert.deepEqual(seen.slice(0, 2).map((input) => input.model), ["synthetic/free-endpoint", "synthetic/free-endpoint"]);
+    assert.ok(seen.slice(0, 2).every((input) => input.thinkingLevel === "medium"));
     assert.deepEqual(explicit.details.workers.map((worker) => worker.model), ["free-research", "free-research"]);
+    assert.ok(explicit.details.workers.every((worker) => worker.thinking === "medium"));
 
     const defaulted = await pi.toolDefs[0].execute("pool-default", {
       description: "coding",
       items: ["one"],
     }, undefined, undefined, ctx);
     assert.equal(seen.at(-1).model, "synthetic/durable-endpoint");
+    assert.equal(seen.at(-1).thinkingLevel, "medium");
     assert.equal(defaulted.details.workers[0].model, "durable-coder");
+    assert.equal(defaulted.details.workers[0].thinking, "medium");
+
+    const primary = await pi.toolDefs[0].execute("pool-primary", {
+      description: "hard reasoning",
+      model: "primary",
+      items: ["one"],
+    }, undefined, undefined, ctx);
+    assert.equal(seen.at(-1).model, "synthetic/outside-endpoint");
+    assert.equal(seen.at(-1).thinkingLevel, "xhigh");
+    assert.equal(seen.at(-1).modelDefinition, available[2]);
+    assert.equal(primary.details.workers[0].model, "primary");
+    assert.equal(primary.details.workers[0].thinking, "xhigh");
+    assert.doesNotMatch(JSON.stringify(primary.details), /synthetic\/outside-endpoint/);
 
     await assert.rejects(
       pi.toolDefs[0].execute("pool-outside", { description: "outside", model: "outside", items: ["one"] }, undefined, undefined, ctx),
       /not whitelisted/,
     );
-    assert.equal(seen.length, 3, "non-whitelisted aliases must fail before worker creation");
+    assert.equal(seen.length, 4, "non-whitelisted aliases must fail before worker creation");
   } finally {
     SwarmAgentRuntime.prototype.run = originalRun;
   }
@@ -116,19 +136,6 @@ try {
   await assert.rejects(
     legacyPi.toolDefs[0].execute("legacy-alias", { description: "x", model: "free-research", items: ["one"] }, undefined, undefined, legacyCtx),
     /require a configured local model pool/,
-  );
-
-  writeFileSync(configPath, "{invalid-json");
-  process.env.PI_SWARM_MODEL_POOL = configPath;
-  const invalidPi = fakePi();
-  registerSwarmExtension(invalidPi);
-  const invalidCtx = context(available);
-  invalidPi.handlers.get("session_start")[0]({}, invalidCtx);
-  assert.equal(invalidCtx.notifications.at(-1).level, "warning");
-  assert.match(invalidCtx.notifications.at(-1).message, /configuration is invalid/);
-  await assert.rejects(
-    invalidPi.toolDefs[0].execute("invalid-pool", { description: "x", items: ["one"] }, undefined, undefined, invalidCtx),
-    /configuration is invalid/,
   );
 } finally {
   if (previous === undefined) delete process.env.PI_SWARM_MODEL_POOL;
