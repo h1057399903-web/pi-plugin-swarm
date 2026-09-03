@@ -35,6 +35,7 @@ export type WorkerStatus = "queued" | "starting" | "running" | "completed" | "fa
 export type WorkerToolName = "read" | "bash" | "edit" | "write" | typeof REPORT_BLOCKED_TOOL;
 export type WorkerToolCounters = Partial<Record<WorkerToolName, number>>;
 export type WorkerProfile = "explore" | "coder";
+export type WorkerThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 export const DEFAULT_WORKER_PROFILE: WorkerProfile = "coder";
 const WORKER_METADATA_TYPE = "pi-plugin-swarm.worker";
 const PROFILE_TOOLS: Record<WorkerProfile, string[]> = {
@@ -43,7 +44,7 @@ const PROFILE_TOOLS: Record<WorkerProfile, string[]> = {
 };
 export interface WorkerProviderRegistration { native?: unknown; config?: unknown; }
 export interface WorkerInput {
-  workerId: string; prompt: string; cwd: string; parentCwd?: string; item?: unknown; timeoutMs?: number; model?: string;
+  workerId: string; prompt: string; cwd: string; parentCwd?: string; item?: unknown; timeoutMs?: number; model?: string; thinkingLevel?: WorkerThinkingLevel;
   /** Host-resolved model/provider data for providers registered dynamically in this Pi process. */
   modelDefinition?: { provider?: unknown; id?: unknown };
   providerRegistration?: WorkerProviderRegistration;
@@ -299,7 +300,7 @@ export class SwarmAgentRuntime {
         };
         const tools = [...PROFILE_TOOLS[profile], REPORT_BLOCKED_TOOL];
         const created = await (this.seams.sessionFactory || createAgentSession)({
-          cwd: workerCwd, modelRuntime: runtime, model, thinkingLevel: WORKER_THINKING_LEVEL,
+          cwd: workerCwd, modelRuntime: runtime, model, thinkingLevel: input.thinkingLevel ?? WORKER_THINKING_LEVEL,
           sessionManager, resourceLoader: loader, tools, customTools: [blockedTool],
         });
         state.session = created.session;
