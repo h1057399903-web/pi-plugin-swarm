@@ -42,11 +42,11 @@ Use synthetic placeholders here; replace them only in your **local private file*
 
 `primary` is built in and must **not** appear in the local `models` table or as `defaultModel`.
 
-When the coordinator passes `model: "primary"`, Swarm reuses the **current main Pi model and its current thinking level** for that run. This is intended for hard or quality-sensitive work. The public run label remains `primary`; the concrete main-model ID is not copied into the model-pool prompt or public run metadata.
+When the coordinator passes `model: "primary"`, Swarm reuses the **current main Pi model and its current thinking level** for that run. This is a reserved quality override for hard or quality-sensitive work, not another user-configured pool member. The public run label remains `primary`; the concrete main-model ID is not copied into the model-pool prompt or public run metadata.
 
 `primary` 是内置保留名，**不能**写进本机 `models` 表，也不能设成 `defaultModel`。
 
-当主模型传入 `model: "primary"` 时，Swarm 会在这一轮复用**当前主 Pi 模型和当前 thinking level**，用于高难度或质量敏感任务。公共 run 仍只显示 `primary`；真实主模型 ID 不会因为这个机制被复制到模型池提示或公共 run 元数据里。
+当主模型传入 `model: "primary"` 时，Swarm 会在这一轮复用**当前主 Pi 模型和当前 thinking level**。它是给高难度/质量敏感任务用的保留“升级通道”，不是用户白名单里的另一个成员。公共 run 仍只显示 `primary`；真实主模型 ID 不会因为这个机制被复制到模型池提示或公共 run 元数据里。
 
 ## Behavior / 行为
 
