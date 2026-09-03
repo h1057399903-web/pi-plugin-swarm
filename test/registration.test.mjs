@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import registerSwarmExtension, { countSwarmWorkers, listSelectableWorkerModels, renderSwarmTaskPrompt, resumeAgentIdsHint, resolveSwarmConcurrency, validateUniqueRenderedPrompts } from "../src/index.ts";
 import { SwarmAgentRuntime } from "../src/swarm-agent-runtime.ts";
 
+process.env.PI_SWARM_MODEL_POOL = "off";
+
 assert.equal(resolveSwarmConcurrency(1), 1);
 assert.equal(resolveSwarmConcurrency(8), 8);
 assert.equal(resolveSwarmConcurrency(128), 16);
